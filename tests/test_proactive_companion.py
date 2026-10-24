@@ -159,6 +159,13 @@ class MockEvent:
         # 与真实事件一致：waking_check 阶段会设置这两个标记
         self.is_wake = False
         self.is_at_or_wake_command = False
+        self._extras: dict[str, Any] = {}
+
+    def set_extra(self, key: str, value: Any) -> None:
+        self._extras[key] = value
+
+    def get_extra(self, key: str, default: Any = None) -> Any:
+        return self._extras.get(key, default)
 
     def get_session_id(self) -> str:
         return self._group_id or self._sender
@@ -383,6 +390,20 @@ def build_fake_astrbot(request_holder: dict[str, MockRequest]) -> None:
 
             return decorator
 
+        @staticmethod
+        def on_llm_request():
+            def decorator(func):
+                return func
+
+            return decorator
+
+        @staticmethod
+        def on_llm_response():
+            def decorator(func):
+                return func
+
+            return decorator
+
     class CustomFilter:
         """模拟 astrbot.api.event.filter.CustomFilter。"""
 
@@ -401,6 +422,8 @@ def build_fake_astrbot(request_holder: dict[str, MockRequest]) -> None:
         "on_astrbot_loaded",
         "on_decorating_result",
         "custom_filter",
+        "on_llm_request",
+        "on_llm_response",
         "platform_adapter_type",
         "permission_type",
     ):
@@ -414,6 +437,36 @@ def build_fake_astrbot(request_holder: dict[str, MockRequest]) -> None:
 
     api_msg = types.ModuleType("astrbot.api.message_components")
     api_msg.Record = MockRecord  # type: ignore[attr-defined]
+
+    # astrbot.core.agent.message：插件用它注入临时的上下文内容块
+    astrbot_core = types.ModuleType("astrbot.core")
+    astrbot_core.__path__ = []  # type: ignore[attr-defined]
+    astrbot_agent = types.ModuleType("astrbot.core.agent")
+    astrbot_agent.__path__ = []  # type: ignore[attr-defined]
+    astrbot_agent_msg = types.ModuleType("astrbot.core.agent.message")
+
+    class TextPart:
+        def __init__(self, text: str = "") -> None:
+            self.type = "text"
+            self.text = text
+            self._no_save = False
+
+        def mark_as_temp(self) -> TextPart:
+            self._no_save = True
+            return self
+
+        def model_dump_for_context(self) -> dict[str, Any]:
+            data = {"type": self.type, "text": self.text}
+            if self._no_save:
+                data["_no_save"] = True
+            return data
+
+    astrbot_agent_msg.TextPart = TextPart  # type: ignore[attr-defined]
+    astrbot_agent.message = astrbot_agent_msg  # type: ignore[attr-defined]
+    astrbot.core = astrbot_core  # type: ignore[attr-defined]
+    sys.modules["astrbot.core"] = astrbot_core
+    sys.modules["astrbot.core.agent"] = astrbot_agent
+    sys.modules["astrbot.core.agent.message"] = astrbot_agent_msg
 
     api_star = types.ModuleType("astrbot.api.star")
 
@@ -899,6 +952,7 @@ async def main() -> None:
         grp, "今天天气真不错", chat_type="GroupMessage", group_id="grpX"
     )
     ev_silent.is_wake = False
+    ev_silent.is_at_or_wake_command = False
     check("白名单命中且概率 1.0 → 触发", plugin.should_proactive_reply(ev_silent, cfg))
     check(
         "触发后事件被标记为可回复",
@@ -908,11 +962,17 @@ async def main() -> None:
     s = await plugin.store.get_session(grp)
     check("主动回复已计数", int((s or {}).get("proactive_replies") or 0) == 1)
 
+    # 其他插件的监听器会把 is_wake 置 True，但不能因此放弃主动回复
     ev_wake = MockEvent(grp, "有人吗", chat_type="GroupMessage", group_id="grpX")
     ev_wake.is_wake = True
+    ev_wake.is_at_or_wake_command = False
     check(
-        "机器人本来就会回复 → 不触发", not plugin.should_proactive_reply(ev_wake, cfg)
+        "is_wake 被其他插件置真时仍可触发", plugin.should_proactive_reply(ev_wake, cfg)
     )
+
+    ev_at = MockEvent(grp, "有人吗", chat_type="GroupMessage", group_id="grpX")
+    ev_at.is_at_or_wake_command = True
+    check("本来就会被 @ 唤醒时不触发", not plugin.should_proactive_reply(ev_at, cfg))
 
     ev_cmd = MockEvent(grp, "/陪伴 状态", chat_type="GroupMessage", group_id="grpX")
     check("指令消息不触发", not plugin.should_proactive_reply(ev_cmd, cfg))
@@ -930,7 +990,7 @@ async def main() -> None:
     check("非白名单用户不触发", not plugin.should_proactive_reply(ev_other, cfg))
 
     plugin.config["proactive_reply_whitelist"] = []
-    check("白名单为空 → 不触发", not plugin.should_proactive_reply(ev_silent, cfg))
+    check("白名单为空 → 不限制（可触发）", plugin.should_proactive_reply(ev_other, cfg))
 
     plugin.config["proactive_reply_whitelist"] = ["*"]
     plugin.config["proactive_reply_probability"] = 0.0
@@ -965,7 +1025,74 @@ async def main() -> None:
     check("插件总开关关闭时不触发", not plugin.should_proactive_reply(ev_other, cfg))
     plugin.config["enabled"] = True
 
-    print("\n== 15. 数据库迁移 ==")
+    print("\n== 15. 上下文采集与注入 ==")
+    plugin.config["capture_context_enabled"] = True
+    plugin.config["proactive_reply_whitelist"] = ["*"]
+    ctx_ev = MockEvent(
+        "aiocqhttp:GroupMessage:grpC",
+        "今天天气真不错",
+        chat_type="GroupMessage",
+        group_id="grpC",
+        sender="user-c",
+    )
+    plugin.capture_message_background(ctx_ev)
+    await asyncio.sleep(0.3)
+    stored = await plugin.store.recent_messages("aiocqhttp:GroupMessage:grpC")
+    check("被动采集已记录消息", len(stored) >= 1, f"got={len(stored)}")
+    check("采集后标记了事件", bool(ctx_ev.get_extra("_pac_message_captured", False)))
+    check(
+        "会话已进入跟踪列表",
+        "aiocqhttp:GroupMessage:grpC" in plugin._tracked_sessions,
+    )
+
+    class _Req:
+        def __init__(self) -> None:
+            self.extra_user_content_parts: list[Any] = []
+
+    req = _Req()
+    ev_inject = MockEvent(
+        "aiocqhttp:GroupMessage:grpC",
+        "那我们明天下午去?",
+        chat_type="GroupMessage",
+        group_id="grpC",
+    )
+    ev_inject.set_extra("_pac_proactive_session", "aiocqhttp:GroupMessage:grpC")
+    await plugin.inject_proactive_context(ev_inject, req)
+    check("上下文已注入 LLM 请求", len(req.extra_user_content_parts) == 1)
+    if req.extra_user_content_parts:
+        part = req.extra_user_content_parts[0]
+        check(
+            "注入内容包含对话记录",
+            "今天天气真不错" in getattr(part, "text", ""),
+            getattr(part, "text", "")[:120],
+        )
+        check(
+            "注入内容标记为临时（不写入历史）",
+            getattr(part, "_no_save", False) is True,
+        )
+
+    req2 = _Req()
+    ev_plain = MockEvent("aiocqhttp:GroupMessage:grpC", "普通消息")
+    await plugin.inject_proactive_context(ev_plain, req2)
+    check("普通请求不注入上下文", len(req2.extra_user_content_parts) == 0)
+
+    # 采集关闭后不再记录
+    plugin.config["capture_context_enabled"] = False
+    before = len(await plugin.store.recent_messages("aiocqhttp:GroupMessage:grpC"))
+    plugin.capture_message_background(
+        MockEvent(
+            "aiocqhttp:GroupMessage:grpD",
+            "另一条消息",
+            chat_type="GroupMessage",
+            group_id="grpD",
+        )
+    )
+    await asyncio.sleep(0.2)
+    after = len(await plugin.store.recent_messages("aiocqhttp:GroupMessage:grpD"))
+    check("关闭采集后不再记录", after == 0, f"got={after}")
+    plugin.config["capture_context_enabled"] = True
+
+    print("\n== 16. 数据库迁移 ==")
     import sqlite3 as _sqlite3
 
     db_path = plugin.store.db_path

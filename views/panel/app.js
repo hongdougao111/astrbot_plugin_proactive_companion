@@ -37,9 +37,12 @@ const CONFIG_FIELDS = [
   { key: "keep_events", label: "保留事件日志条数", type: "int", min: 50 },
   { key: "proactive_reply_enabled", label: "启用主动回复", type: "bool" },
   { key: "proactive_reply_probability", label: "主动回复概率 (0.0-1.0)", type: "float", min: 0 },
-  { key: "proactive_reply_whitelist", label: "主动回复白名单", type: "text", hint: "用户 ID / 群号 / 会话 ID，逗号分隔；留空=不允许任何人；* = 不限制" },
+  { key: "proactive_reply_whitelist", label: "主动回复白名单", type: "text", hint: "用户 ID / 群号 / 会话 ID，逗号分隔；留空 = 不限制；* = 不限制" },
   { key: "proactive_reply_cooldown_minutes", label: "主动回复冷却(分钟)", type: "int", min: 0 },
   { key: "proactive_reply_min_length", label: "最短触发消息长度", type: "int", min: 0 },
+  { key: "capture_context_enabled", label: "采集对话上下文", type: "bool" },
+  { key: "proactive_reply_context_messages", label: "注入上下文条数", type: "int", min: 1 },
+  { key: "capture_context_max_sessions", label: "最多采集会话数", type: "int", min: 1 },
   { key: "system_prompt", label: "人设提示词", type: "textarea" },
 ];
 
@@ -82,12 +85,16 @@ async function loadState() {
     { num: data.sessions, label: "会话总数" },
     { num: data.active_sessions, label: "已开启会话" },
     { num: data.sent_today, label: "今日已发送" },
+    { num: data.proactive_replies_total ?? 0, label: "主动回复次数" },
     { num: data.in_quiet_hours ? "免打扰" : "可打扰", label: "时段状态" },
   ];
   $("#stat-cards").innerHTML = cards
     .map((c) => `<div class="card stat"><div class="num">${esc(c.num)}</div><div class="label">${esc(c.label)}</div></div>`)
     .join("");
 
+  const skipReasons = Object.entries(data.proactive_reply_skip_reasons || {})
+    .map(([k, v]) => `${k}×${v}`)
+    .join("、");
   const detail = [
     ["插件状态", data.enabled ? "运行中" : "已停用"],
     ["调度器", data.running ? "在线" : "未启动"],
@@ -95,6 +102,21 @@ async function loadState() {
     ["免打扰时段", (data.quiet_hours || []).join("、") || "未设置"],
     ["下一次可打扰", data.next_available || "现在"],
     ["情绪标签", data.mood_label],
+    ["主动回复", data.proactive_reply_enabled ? "已开启" : "未开启"],
+    [
+      "回复概率",
+      `${data.proactive_reply_probability ?? 0}（白名单：${
+        (data.proactive_reply_whitelist || []).join("、") || "空 = 不限制"
+      }）`,
+    ],
+    ["最近判定", data.proactive_reply_last_decision || "—"],
+    ["跳过原因 TOP", skipReasons || "—"],
+    [
+      "上下文采集",
+      `${data.capture_context_enabled ? "开" : "关"}（已跟踪 ${
+        data.captured_sessions ?? 0
+      } 个会话）`,
+    ],
     ["TTS", data.tts_enabled ? "已启用" : "未启用"],
     ["上次检查", fmtTime(data.last_tick_at)],
     ["最近错误", data.last_tick_error || "无"],
