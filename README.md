@@ -17,6 +17,27 @@
 | 🔊 TTS 集成 | 可选用 AstrBot 的 TTS Provider，把主动消息转成语音 |
 | 🖥️ 独立 WebUI | 插件自带可视化面板，管理会话、情绪、配置与日志 |
 
+## 💬 主动回复
+
+除了「定时主动搭话」，插件还能在**机器人本来不会回复**的消息上主动接话——比如群里
+有人随口说了一句话，Bot 按概率决定要不要冒个泡。
+
+它不自己生成内容，而是把消息交回 AstrBot 的正常 LLM 链路，所以语气、人设、上下文
+和被 @ 时完全一样。
+
+触发条件（全部满足才会接话）：
+
+1. `proactive_reply_enabled` 已开启；
+2. 消息**不会**唤醒机器人（群里没被 @、私聊需要唤醒词等）；
+3. 消息不是指令（`/` 开头或命中唤醒词），避免和指令回复撞车；
+4. 长度不小于 `proactive_reply_min_length`；
+5. 不在免打扰时段内；
+6. 发送者 ID / 群号 / 会话 ID 命中 `proactive_reply_whitelist`；
+7. 距上次主动回复超过 `proactive_reply_cooldown_minutes`；
+8. 通过 `proactive_reply_probability` 的概率判定。
+
+白名单留空表示**不允许任何人**主动回复（白名单语义）；填 `*` 表示不限制。
+
 ## 📦 安装
 
 在 AstrBot WebUI 的 **插件市场** 中搜索 `主动陪伴` / `proactive_companion` 安装，
@@ -55,6 +76,11 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 | `max_daily_messages` | `6` | 每会话每日上限（0 = 不限） |
 | `max_proactive_per_tick` | `3` | 单轮检查最多发几条，避免一次性触发大量 LLM 请求 |
 | `idle_jitter_ratio` | `0.2` | 静默阈值随机抖动比例，避免所有会话同时被触发 |
+| `proactive_reply_enabled` | `false` | 启用主动回复 |
+| `proactive_reply_probability` | `0.2` | 主动回复概率（0.0–1.0），0 = 永不，1 = 总是 |
+| `proactive_reply_whitelist` | `[]` | 主动回复白名单（用户 ID / 群号 / 会话 ID；`*` = 不限制；留空 = 不允许任何人） |
+| `proactive_reply_cooldown_minutes` | `10` | 同一会话两次主动回复的最小间隔 |
+| `proactive_reply_min_length` | `2` | 触发主动回复的最短消息长度 |
 | `group_enabled` / `private_enabled` | `true` | 是否允许在群聊 / 私聊主动发言 |
 | `mention_only_in_group` | `false` | 群里只有被 @ 过才主动说话 |
 | `mood_enabled` | `true` | 是否启用动态情绪 |
@@ -95,7 +121,19 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 python tests/test_proactive_companion.py
 ```
 
-当前结果：**61 项断言全部通过**。
+当前结果：**77 项断言全部通过**。
+
+## 📋 更新日志
+
+### v1.0.1
+
+- **新增主动回复**：在机器人本来不会回复的消息上，按「回复概率」+「白名单」主动接话，
+  走正常 LLM 链路，语气人设与被 @ 时一致
+- 新增配置：`proactive_reply_enabled` / `proactive_reply_probability` /
+  `proactive_reply_whitelist` / `proactive_reply_cooldown_minutes` /
+  `proactive_reply_min_length`
+- WebUI 面板新增主动回复相关配置项与触发次数统计
+- 数据库自动迁移：sessions 表新增 `proactive_replies` 列（升级不丢数据）
 
 ## ❓ 常见问题
 

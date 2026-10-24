@@ -131,5 +131,38 @@
     "description": "保留的事件日志条数",
     "type": "int",
     "default": 1000
+  },
+  "proactive_reply_enabled": {
+    "description": "启用主动回复",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，机器人会在本来不会回复的消息上按概率主动接话（群里没被 @、私聊需要唤醒词等场景）。"
+  },
+  "proactive_reply_probability": {
+    "description": "主动回复概率（0.0-1.0）",
+    "type": "float",
+    "default": 0.2,
+    "hint": "每条符合条件的消息有多大概率触发主动回复。0 表示永不触发，1 表示总是触发。"
+  },
+  "proactive_reply_whitelist": {
+    "description": "主动回复白名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "填用户 ID、群号、会话 ID 或 unified_msg_origin，命中任意一项即可。留空表示不允许任何人主动回复；填 * 表示不限制。"
+  },
+  "proactive_reply_cooldown_minutes": {
+    "description": "主动回复冷却（分钟）",
+    "type": "int",
+    "default": 10,
+    "hint": "同一会话两次主动回复之间的最小间隔，避免刷屏。设为 0 表示不限制。"
+  },
+  "proactive_reply_min_length": {
+    "description": "触发主动回复的最短消息长度",
+    "type": "int",
+    "default": 2,
+    "hint": "太短的消息（如「嗯」「？」）不触发主动回复。"
   }
 }

@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_msg_at     REAL NOT NULL DEFAULT 0,
     last_proactive_at REAL NOT NULL DEFAULT 0,
     messages_sent   INTEGER NOT NULL DEFAULT 0,
+    proactive_replies INTEGER NOT NULL DEFAULT 0,
     daily_count     INTEGER NOT NULL DEFAULT 0,
     daily_date      TEXT DEFAULT '',
     valence         REAL NOT NULL DEFAULT 0,
@@ -96,8 +97,34 @@ class Store:
     def _init_schema(self) -> None:
         def _do(conn: sqlite3.Connection) -> None:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
 
         self._run_sync(_do)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """为旧版本数据库补齐新增列（插件升级后不丢数据）。"""
+        additions = {
+            "sessions": {
+                "proactive_replies": "INTEGER NOT NULL DEFAULT 0",
+            },
+        }
+        for table, columns in additions.items():
+            try:
+                existing = {
+                    row["name"]
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+            except sqlite3.Error:
+                continue
+            if not existing:
+                continue
+            for column, ddl in columns.items():
+                if column not in existing:
+                    try:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                    except sqlite3.Error:
+                        pass
 
     @staticmethod
     def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -184,6 +211,7 @@ class Store:
             "last_msg_at",
             "last_proactive_at",
             "messages_sent",
+            "proactive_replies",
             "daily_count",
             "daily_date",
             "valence",

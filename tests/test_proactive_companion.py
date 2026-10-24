@@ -156,6 +156,12 @@ class MockEvent:
             group_id=group_id,
         )
         self._result: Any = None
+        # 与真实事件一致：waking_check 阶段会设置这两个标记
+        self.is_wake = False
+        self.is_at_or_wake_command = False
+
+    def get_session_id(self) -> str:
+        return self._group_id or self._sender
 
     def set_result(self, reply: str) -> None:
         """模拟机器人即将发送的回复。"""
@@ -369,11 +375,42 @@ def build_fake_astrbot(request_holder: dict[str, MockRequest]) -> None:
 
             return decorator
 
-    api_event.filter = _Filter()  # type: ignore[attr-defined]
-    # 真实 API 中 filter 是模块，EventMessageType 等从模块导出
-    api_event.filter.EventMessageType = EventMessageType
-    api_event.filter.PermissionType = type("PermissionType", (), {})
-    api_event.filter.PlatformAdapterType = type("PlatformAdapterType", (), {})
+        @staticmethod
+        def custom_filter(filter_cls: Any, *args: Any):
+            def decorator(func):
+                func._custom_filter = filter_cls
+                return func
+
+            return decorator
+
+    class CustomFilter:
+        """模拟 astrbot.api.event.filter.CustomFilter。"""
+
+        def __init__(self, raise_error: bool = True, **kwargs: Any) -> None:
+            self.raise_error = raise_error
+
+        def filter(self, event: Any, cfg: Any) -> bool:
+            return False
+
+    # 真实的 filter 是一个模块（不是实例），插件会 `from astrbot.api.event.filter import CustomFilter`
+    api_filter = types.ModuleType("astrbot.api.event.filter")
+    for _fn_name in (
+        "command",
+        "command_group",
+        "event_message_type",
+        "on_astrbot_loaded",
+        "on_decorating_result",
+        "custom_filter",
+        "platform_adapter_type",
+        "permission_type",
+    ):
+        setattr(api_filter, _fn_name, getattr(_Filter, _fn_name))
+    api_filter.CustomFilter = CustomFilter
+    api_filter.EventMessageType = EventMessageType
+    api_filter.PermissionType = type("PermissionType", (), {})
+    api_filter.PlatformAdapterType = type("PlatformAdapterType", (), {})
+    api_event.filter = api_filter  # type: ignore[assignment]
+    sys.modules["astrbot.api.event.filter"] = api_filter
 
     api_msg = types.ModuleType("astrbot.api.message_components")
     api_msg.Record = MockRecord  # type: ignore[attr-defined]
@@ -848,6 +885,94 @@ async def main() -> None:
     await asyncio.sleep(0.05)
     await plugin.terminate()
     check("调度任务已停止", plugin._task is None)
+
+    print("\n== 14. 主动回复判定 ==")
+    plugin.config["proactive_reply_enabled"] = True
+    plugin.config["proactive_reply_probability"] = 1.0
+    plugin.config["proactive_reply_whitelist"] = ["user-1"]
+    plugin.config["proactive_reply_cooldown_minutes"] = 0
+    plugin.config["proactive_reply_min_length"] = 2
+
+    cfg = MockAstrBotConfig({"wake_prefix": ["/"]})
+    grp = "aiocqhttp:GroupMessage:grpX"
+    ev_silent = MockEvent(
+        grp, "今天天气真不错", chat_type="GroupMessage", group_id="grpX"
+    )
+    ev_silent.is_wake = False
+    check("白名单命中且概率 1.0 → 触发", plugin.should_proactive_reply(ev_silent, cfg))
+    check(
+        "触发后事件被标记为可回复",
+        (await plugin.proactive_reply(ev_silent)) is None
+        and ev_silent.is_at_or_wake_command is True,
+    )
+    s = await plugin.store.get_session(grp)
+    check("主动回复已计数", int((s or {}).get("proactive_replies") or 0) == 1)
+
+    ev_wake = MockEvent(grp, "有人吗", chat_type="GroupMessage", group_id="grpX")
+    ev_wake.is_wake = True
+    check(
+        "机器人本来就会回复 → 不触发", not plugin.should_proactive_reply(ev_wake, cfg)
+    )
+
+    ev_cmd = MockEvent(grp, "/陪伴 状态", chat_type="GroupMessage", group_id="grpX")
+    check("指令消息不触发", not plugin.should_proactive_reply(ev_cmd, cfg))
+
+    ev_short = MockEvent(grp, "嗯", chat_type="GroupMessage", group_id="grpX")
+    check("过短消息不触发", not plugin.should_proactive_reply(ev_short, cfg))
+
+    ev_other = MockEvent(
+        "aiocqhttp:GroupMessage:grpY",
+        "在吗",
+        chat_type="GroupMessage",
+        group_id="grpY",
+        sender="user-999",
+    )
+    check("非白名单用户不触发", not plugin.should_proactive_reply(ev_other, cfg))
+
+    plugin.config["proactive_reply_whitelist"] = []
+    check("白名单为空 → 不触发", not plugin.should_proactive_reply(ev_silent, cfg))
+
+    plugin.config["proactive_reply_whitelist"] = ["*"]
+    plugin.config["proactive_reply_probability"] = 0.0
+    check("概率为 0 → 不触发", not plugin.should_proactive_reply(ev_other, cfg))
+
+    plugin.config["proactive_reply_probability"] = 0.5
+    hits = sum(1 for _ in range(200) if plugin.should_proactive_reply(ev_other, cfg))
+    check("概率 0.5 大致命中一半", 40 < hits < 160, f"hits={hits}")
+
+    plugin.config["proactive_reply_probability"] = 1.0
+    plugin.config["proactive_reply_cooldown_minutes"] = 30
+    ev_cd = MockEvent(
+        "aiocqhttp:GroupMessage:grpZ",
+        "在吗",
+        chat_type="GroupMessage",
+        group_id="grpZ",
+    )
+    check("冷却前首次可触发", plugin.should_proactive_reply(ev_cd, cfg))
+    plugin._proactive_reply_times[ev_cd.unified_msg_origin] = time.time()
+    check("冷却期内不再触发", not plugin.should_proactive_reply(ev_cd, cfg))
+
+    plugin.config["quiet_hours"] = ["00:00-23:59"]
+    plugin.config["proactive_reply_cooldown_minutes"] = 0
+    check("免打扰时段内不触发", not plugin.should_proactive_reply(ev_other, cfg))
+    plugin.config["quiet_hours"] = []
+
+    plugin.config["proactive_reply_enabled"] = False
+    check("总开关关闭时不触发", not plugin.should_proactive_reply(ev_other, cfg))
+    plugin.config["proactive_reply_enabled"] = True
+
+    plugin.config["enabled"] = False
+    check("插件总开关关闭时不触发", not plugin.should_proactive_reply(ev_other, cfg))
+    plugin.config["enabled"] = True
+
+    print("\n== 15. 数据库迁移 ==")
+    import sqlite3 as _sqlite3
+
+    db_path = plugin.store.db_path
+    conn = _sqlite3.connect(str(db_path))
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    conn.close()
+    check("sessions 表含 proactive_replies 列", "proactive_replies" in cols)
 
     shutil.rmtree(tmp, ignore_errors=True)
 

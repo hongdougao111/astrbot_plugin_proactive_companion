@@ -35,6 +35,11 @@ const CONFIG_FIELDS = [
   { key: "max_context_messages", label: "上下文消息条数", type: "int", min: 1 },
   { key: "keep_messages_per_session", label: "每会话保留消息数", type: "int", min: 10 },
   { key: "keep_events", label: "保留事件日志条数", type: "int", min: 50 },
+  { key: "proactive_reply_enabled", label: "启用主动回复", type: "bool" },
+  { key: "proactive_reply_probability", label: "主动回复概率 (0.0-1.0)", type: "float", min: 0 },
+  { key: "proactive_reply_whitelist", label: "主动回复白名单", type: "text", hint: "用户 ID / 群号 / 会话 ID，逗号分隔；留空=不允许任何人；* = 不限制" },
+  { key: "proactive_reply_cooldown_minutes", label: "主动回复冷却(分钟)", type: "int", min: 0 },
+  { key: "proactive_reply_min_length", label: "最短触发消息长度", type: "int", min: 0 },
   { key: "system_prompt", label: "人设提示词", type: "textarea" },
 ];
 
