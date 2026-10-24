@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_key TEXT NOT NULL,
     role        TEXT NOT NULL,
     sender      TEXT DEFAULT '',
+    sender_id   TEXT DEFAULT '',
     content     TEXT DEFAULT '',
     ts          REAL NOT NULL
 );
@@ -113,6 +114,9 @@ class Store:
                 "atmosphere_level": "TEXT DEFAULT ''",
                 "atmosphere_data": "TEXT DEFAULT ''",
                 "atmosphere_updated_at": "REAL NOT NULL DEFAULT 0",
+            },
+            "messages": {
+                "sender_id": "TEXT DEFAULT ''",
             },
         }
         for table, columns in additions.items():
@@ -264,15 +268,17 @@ class Store:
         role: str,
         content: str,
         sender: str = "",
+        sender_id: str = "",
         ts: float | None = None,
     ) -> None:
+        """写入一条消息。sender 是昵称，sender_id 是用户唯一标识。"""
         ts = time.time() if ts is None else ts
 
         def _do(conn: sqlite3.Connection) -> None:
             conn.execute(
-                "INSERT INTO messages (session_key, role, sender, content, ts)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (session_key, role, sender, content, ts),
+                "INSERT INTO messages (session_key, role, sender, sender_id, content, ts)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (session_key, role, sender, sender_id, content, ts),
             )
 
         await self._run(_do)
@@ -282,7 +288,7 @@ class Store:
     ) -> list[dict[str, Any]]:
         def _do(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             rows = conn.execute(
-                "SELECT role, sender, content, ts FROM messages"
+                "SELECT role, sender, sender_id, content, ts FROM messages"
                 " WHERE session_key = ? ORDER BY id DESC LIMIT ?",
                 (session_key, limit),
             ).fetchall()

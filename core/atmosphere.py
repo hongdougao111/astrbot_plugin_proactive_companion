@@ -171,11 +171,19 @@ def analyze(
         )
 
     texts = [str(m.get("content") or "") for m in recent]
+    # 参与人数按用户 ID 统计（昵称可能重名，不能用来区分人）
     senders = {
-        str(m.get("sender") or "").strip()
+        str(m.get("sender_id") or "").strip()
         for m in recent
-        if str(m.get("sender") or "").strip()
+        if str(m.get("sender_id") or "").strip()
     }
+    if not senders:
+        # 老数据没有 sender_id，退回用昵称
+        senders = {
+            str(m.get("sender") or "").strip()
+            for m in recent
+            if str(m.get("sender") or "").strip()
+        }
     timestamps = [float(m.get("ts") or 0.0) for m in recent if m.get("ts")]
     span_minutes = 1.0
     if len(timestamps) >= 2:

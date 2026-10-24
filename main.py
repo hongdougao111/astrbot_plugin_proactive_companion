@@ -354,22 +354,42 @@ class ProactiveCompanionPlugin(Star):
     def _format_context_block(
         self, messages: list[dict[str, Any]], atmosphere_hint: str = ""
     ) -> str:
-        """把记录的消息格式化成给 LLM 的上下文块。"""
+        """把记录的消息格式化成给 LLM 的上下文块。
+
+        同名用户会被标注用户 ID 片段，避免模型把不同的人当成同一个人。
+        """
+        # 统计「昵称 -> 用户 ID」的映射，判断哪些昵称存在重名
+        name_to_ids: dict[str, set[str]] = {}
+        for msg in messages:
+            name = str(msg.get("sender") or "").strip()
+            sid = str(msg.get("sender_id") or "").strip()
+            if name and sid:
+                name_to_ids.setdefault(name, set()).add(sid)
+
+        def _label(msg: dict[str, Any]) -> str:
+            name = str(msg.get("sender") or "").strip()
+            sid = str(msg.get("sender_id") or "").strip()
+            if not name:
+                return sid or "对方"
+            if sid and len(name_to_ids.get(name, set())) > 1:
+                # 有重名：补上用户 ID 末四位以便区分
+                return f"{name}#{sid[-4:]}"
+            return name
+
         lines: list[str] = []
         for msg in messages:
             content = str(msg.get("content") or "").strip()
             if not content:
                 continue
             role = str(msg.get("role") or "")
-            sender = str(msg.get("sender") or "").strip()
             if role == "user":
-                lines.append(f"{sender or '对方'}: {content}")
+                lines.append(f"{_label(msg)}: {content}")
             elif role == "bot":
                 lines.append(f"我: {content}")
             elif role == "proactive":
                 lines.append(f"我(之前主动搭话): {content}")
             else:
-                lines.append(f"{sender or '对方'}: {content}")
+                lines.append(f"{_label(msg)}: {content}")
         if not lines:
             return atmosphere_hint
         body = "\n".join(lines)
@@ -427,8 +447,10 @@ class ProactiveCompanionPlugin(Star):
     async def _capture_message(self, event: AstrMessageEvent, content: str) -> None:
         umo = event.unified_msg_origin
         sender = ""
+        sender_id = ""
         try:
-            sender = event.get_sender_name() or event.get_sender_id() or ""
+            sender = event.get_sender_name() or ""
+            sender_id = str(event.get_sender_id() or "")
         except Exception:
             sender = ""
         await self.store.ensure_session(
@@ -439,7 +461,7 @@ class ProactiveCompanionPlugin(Star):
             self._session_title(event),
         )
         self._tracked_sessions.add(umo)
-        await self.store.add_message(umo, "user", content, sender)
+        await self.store.add_message(umo, "user", content, sender, sender_id)
         try:
             event.set_extra(_CAPTURED_FLAG, True)
         except Exception:  # pragma: no cover
@@ -605,6 +627,9 @@ class ProactiveCompanionPlugin(Star):
         min_length = max(0, self._cfg_int("proactive_reply_min_length", 2))
         if len(content) < min_length:
             return False, f"消息过短（<{min_length}）"
+        # 别人之间互相 @ 时不要插嘴（这句话不是对我们说的）
+        if self._mentions_other(event):
+            return False, "消息在 @ 其他人"
         if self._looks_like_command(content, cfg):
             return False, "指令消息"
         if dnd.in_quiet_hours(_dt.datetime.now(), self._cfg_list("quiet_hours", [])):
@@ -716,7 +741,12 @@ class ProactiveCompanionPlugin(Star):
         platform = event.get_platform_name() or ""
         await self.store.ensure_session(umo, umo, platform, chat_type, title)
 
-        sender_name = event.get_sender_name() or event.get_sender_id() or ""
+        sender_name = event.get_sender_name() or ""
+        sender_id = ""
+        try:
+            sender_id = str(event.get_sender_id() or "")
+        except Exception:
+            sender_id = ""
         now = time.time()
         update: dict[str, Any] = {"last_msg_at": now}
         if self._mentions_bot(event):
@@ -726,13 +756,33 @@ class ProactiveCompanionPlugin(Star):
 
         if content and not event.get_extra(_CAPTURED_FLAG, False):
             # 被动采集已经记录过这条消息时不要重复入库
-            await self.store.add_message(umo, "user", content, sender_name)
+            await self.store.add_message(umo, "user", content, sender_name, sender_id)
         if reply:
-            await self.store.add_message(umo, "bot", reply, "bot")
+            await self.store.add_message(umo, "bot", reply, "bot", "")
         await self.store.update_session(umo, **update)
 
         if content and self._cfg_bool("mood_enabled", True):
             await self._apply_mood_event(umo, content)
+
+    def _mentions_other(self, event: AstrMessageEvent) -> bool:
+        """判断消息是否在 @ 别人（不是 @ 机器人）。
+
+        群里大家互相 @ 时，这句话不是对我们说的，主动回复应该让位。
+        """
+        try:
+            self_id = str(event.get_self_id() or "")
+            for comp in getattr(event.message_obj, "message", []) or []:
+                if str(getattr(comp, "type", "")).lower() != "at":
+                    continue
+                qq = str(getattr(comp, "qq", "") or "")
+                if not qq or qq == "all":
+                    # @ 全体成员属于对所有人说话，框架本身会唤醒机器人
+                    continue
+                if qq != self_id:
+                    return True
+        except Exception:
+            return False
+        return False
 
     def _mentions_bot(self, event: AstrMessageEvent) -> bool:
         """判断消息中是否 @ 了机器人。"""

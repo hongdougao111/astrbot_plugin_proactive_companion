@@ -237,7 +237,9 @@ async function loadMessages(key) {
   const items = (data.messages || [])
     .map(
       (m) => `<div class="msg ${esc(m.role)}">
-        <div class="meta">${esc(m.role)} · ${esc(m.sender || "")} · ${fmtTime(m.ts)}</div>
+        <div class="meta">${esc(m.role)} · ${esc(m.sender || "")}${
+        m.sender_id ? ` (${esc(m.sender_id)})` : ""
+      } · ${fmtTime(m.ts)}</div>
         <div>${esc(m.content)}</div>
       </div>`
     )

@@ -1232,7 +1232,92 @@ async def main() -> None:
         repr(fixed.config.get("proactive_reply_whitelist")),
     )
 
-    print("\n== 19. 数据库迁移 ==")
+    print("\n== 20. @别人不插嘴 / 用户身份识别 ==")
+    # 消息里 @ 的是别人 → 不应主动回复
+    ev_at_other = MockEvent(
+        "aiocqhttp:GroupMessage:grpAt",
+        "你今天有空吗",
+        chat_type="GroupMessage",
+        group_id="grpAt",
+    )
+    ev_at_other.message_obj.message = [MockComponent("At", qq="someone-else")]
+    check("消息在 @ 别人 → 不触发", not plugin.should_proactive_reply(ev_at_other, cfg))
+    check(
+        "判定原因已记录",
+        "@" in plugin._last_reply_decision and "其他" in plugin._last_reply_decision,
+        plugin._last_reply_decision,
+    )
+
+    # @ 机器人 → 框架本身会唤醒，不需要我们插手
+    ev_at_bot = MockEvent(
+        "aiocqhttp:GroupMessage:grpAt2",
+        "你今天有空吗",
+        chat_type="GroupMessage",
+        group_id="grpAt2",
+    )
+    ev_at_bot.message_obj.message = [MockComponent("At", qq="bot-1")]
+    ev_at_bot.is_at_or_wake_command = True
+    check(
+        "@ 机器人 → 不触发（框架已唤醒）",
+        not plugin.should_proactive_reply(ev_at_bot, cfg),
+    )
+
+    # @ 全体成员 → 也交给框架处理
+    ev_at_all = MockEvent(
+        "aiocqhttp:GroupMessage:grpAt3",
+        "大家看一下",
+        chat_type="GroupMessage",
+        group_id="grpAt3",
+    )
+    ev_at_all.message_obj.message = [MockComponent("At", qq="all")]
+    ev_at_all.is_at_or_wake_command = True
+    check("@ 全体成员 → 不触发", not plugin.should_proactive_reply(ev_at_all, cfg))
+
+    # 用户身份：昵称 + ID 都要记录
+    id_umo = "aiocqhttp:GroupMessage:grpId"
+    ev_id = MockEvent(
+        id_umo,
+        "我叫小明",
+        chat_type="GroupMessage",
+        group_id="grpId",
+        sender="小明",
+    )
+    ev_id.get_sender_id = lambda: "10001"  # type: ignore[method-assign]
+    ev_id.get_sender_name = lambda: "小明"  # type: ignore[method-assign]
+    plugin.capture_message_background(ev_id)
+    await asyncio.sleep(0.3)
+    msgs = await plugin.store.recent_messages(id_umo)
+    check("消息记录了昵称", msgs and msgs[0].get("sender") == "小明", str(msgs[:1]))
+    check(
+        "消息记录了用户 ID", msgs and msgs[0].get("sender_id") == "10001", str(msgs[:1])
+    )
+
+    # 同名不同 ID → 上下文里要能区分
+    dup_umo = "aiocqhttp:GroupMessage:grpDup"
+    for sid in ("20001", "20002"):
+        await plugin.store.add_message(dup_umo, "user", f"来自{sid}的话", "小明", sid)
+    block = plugin._format_context_block(
+        await plugin.store.recent_messages(dup_umo, 10)
+    )
+    check(
+        "同名用户被标注 ID 以便区分",
+        "小明#0001" in block and "小明#0002" in block,
+        block[:200],
+    )
+
+    # 昵称不重复时保持干净
+    clean_umo = "aiocqhttp:GroupMessage:grpClean"
+    await plugin.store.add_message(clean_umo, "user", "你好", "小红", "30001")
+    block2 = plugin._format_context_block(
+        await plugin.store.recent_messages(clean_umo, 10)
+    )
+    check(
+        "无重名时不加 ID 后缀",
+        "小红:" in block2 and "小红#" not in block2,
+        block2[:120],
+    )
+
+    print("\n== 21. 数据库迁移 ==")
     import sqlite3 as _sqlite3
 
     db_path = plugin.store.db_path
