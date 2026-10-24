@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     daily_date      TEXT DEFAULT '',
     valence         REAL NOT NULL DEFAULT 0,
     arousal         REAL NOT NULL DEFAULT 0.3,
+    atmosphere_level TEXT DEFAULT '',
+    atmosphere_data TEXT DEFAULT '',
+    atmosphere_updated_at REAL NOT NULL DEFAULT 0,
     mood_updated_at REAL NOT NULL DEFAULT 0,
     created_at      REAL NOT NULL DEFAULT 0,
     note            TEXT DEFAULT ''
@@ -107,6 +110,9 @@ class Store:
         additions = {
             "sessions": {
                 "proactive_replies": "INTEGER NOT NULL DEFAULT 0",
+                "atmosphere_level": "TEXT DEFAULT ''",
+                "atmosphere_data": "TEXT DEFAULT ''",
+                "atmosphere_updated_at": "REAL NOT NULL DEFAULT 0",
             },
         }
         for table, columns in additions.items():
@@ -217,6 +223,9 @@ class Store:
             "valence",
             "arousal",
             "mood_updated_at",
+            "atmosphere_level",
+            "atmosphere_data",
+            "atmosphere_updated_at",
             "note",
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
@@ -343,6 +352,49 @@ class Store:
             )
 
         await self._run(_do)
+
+    # ------------------------------------------------------------------
+    # 气氛
+    # ------------------------------------------------------------------
+    async def update_atmosphere(
+        self, session_key: str, atmosphere: dict[str, Any]
+    ) -> None:
+        """保存某个会话的气氛快照。"""
+        try:
+            payload = json.dumps(atmosphere, ensure_ascii=False)
+        except (TypeError, ValueError):
+            payload = "{}"
+
+        def _do(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE sessions SET atmosphere_level = ?, atmosphere_data = ?,"
+                " atmosphere_updated_at = ? WHERE session_key = ?",
+                (
+                    str(atmosphere.get("level") or ""),
+                    payload,
+                    float(atmosphere.get("updated_at") or 0.0),
+                    session_key,
+                ),
+            )
+
+        await self._run(_do)
+
+    async def get_atmosphere(self, session_key: str) -> dict[str, Any] | None:
+        """读取某个会话最近一次的气象快照。"""
+
+        def _do(conn: sqlite3.Connection) -> dict[str, Any] | None:
+            row = conn.execute(
+                "SELECT atmosphere_data FROM sessions WHERE session_key = ?",
+                (session_key,),
+            ).fetchone()
+            if row is None or not row["atmosphere_data"]:
+                return None
+            try:
+                return json.loads(row["atmosphere_data"])
+            except (TypeError, ValueError):
+                return None
+
+        return await self._run(_do)
 
     # ------------------------------------------------------------------
     # KV

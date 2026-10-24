@@ -1092,7 +1092,100 @@ async def main() -> None:
     check("关闭采集后不再记录", after == 0, f"got={after}")
     plugin.config["capture_context_enabled"] = True
 
-    print("\n== 16. 数据库迁移 ==")
+    print("\n== 17. 读空气（气氛感知）==")
+    from core import atmosphere as atmo  # type: ignore
+
+    now = time.time()
+
+    def _msg(content: str, sender: str, offset: float = 0.0) -> dict:
+        return {
+            "content": content,
+            "sender": sender,
+            "ts": now - offset,
+            "role": "user",
+        }
+
+    # 冷清：两条消息隔了近半小时
+    cold = atmo.analyze(
+        [_msg("在吗", "u1", 1750), _msg("有人吗", "u2", 60)],
+        now=now,
+        window_minutes=30,
+    )
+    check("久无发言 → 冷清", cold.level == atmo.LEVEL_COLD, cold.level)
+    check("冷清时给出暖场建议", "暖场" in cold.advice or "话题" in cold.advice)
+
+    # 热闹：多人高频发言
+    hot_msgs = [_msg(f"消息{i}", f"u{i % 4}", i * 5) for i in range(24)]
+    hot = atmo.analyze(hot_msgs, now=now, window_minutes=30)
+    check("高频多人发言 → 热闹", hot.level == atmo.LEVEL_HOT, hot.level)
+    check("热闹时不插嘴", atmo.probability_factor(hot) < 1.0)
+
+    # 紧张：出现冲突措辞
+    tense_msgs = [
+        _msg("你给我闭嘴", "u1", 30),
+        _msg("滚蛋", "u2", 20),
+        _msg("举报你", "u3", 10),
+    ]
+    tense = atmo.analyze(tense_msgs, now=now, window_minutes=30)
+    check("冲突措辞 → 紧张", tense.level == atmo.LEVEL_TENSE, tense.level)
+    check("紧张时完全不出声", atmo.probability_factor(tense) == 0.0)
+    check("紧张时不发主动消息", not atmo.allow_proactive_message(tense))
+    check("冷清时允许主动消息", atmo.allow_proactive_message(cold))
+
+    # 正常
+    normal = atmo.analyze(
+        [_msg("今天吃了吗", "u1", 120), _msg("吃了", "u2", 60)], now=now
+    )
+    check("普通闲聊 → 正常", normal.level == atmo.LEVEL_NORMAL, normal.level)
+
+    check(
+        "机器人自己的发言不计入气氛",
+        atmo.analyze(
+            [
+                {"content": "bot 刷屏", "sender": "bot", "ts": now - 10, "role": "bot"},
+                {
+                    "content": "bot 又刷屏",
+                    "sender": "bot",
+                    "ts": now - 5,
+                    "role": "bot",
+                },
+            ],
+            now=now,
+        ).level
+        == atmo.LEVEL_COLD,
+    )
+
+    # 插件侧：气氛会影响主动回复判定
+    plugin.config["atmosphere_enabled"] = True
+    plugin.config["atmosphere_boost"] = 1.5
+    air_umo = "aiocqhttp:GroupMessage:air"
+    plugin._atmosphere_cache[air_umo] = atmo.analyze(tense_msgs, now=now)
+    ev_air = MockEvent(air_umo, "随便说句", chat_type="GroupMessage", group_id="air")
+    ev_air.is_at_or_wake_command = False
+    check(
+        "气氛紧张 → 不触发主动回复",
+        not plugin.should_proactive_reply(ev_air, cfg),
+    )
+    plugin._atmosphere_cache[air_umo] = atmo.analyze([_msg("在吗", "u1", 900)], now=now)
+    check(
+        "气氛冷清 → 仍可触发（概率被放大）",
+        plugin.should_proactive_reply(ev_air, cfg),
+    )
+    plugin._atmosphere_cache.pop(air_umo, None)
+    plugin.config["atmosphere_enabled"] = False
+    check(
+        "关闭读空气后不再受气氛影响",
+        plugin.should_proactive_reply(ev_air, cfg),
+    )
+    plugin.config["atmosphere_enabled"] = True
+
+    # 面板接口应带上气氛
+    resp = await plugin.api_sessions()
+    check("会话接口返回气氛字段", "atmosphere_level" in resp.payload["sessions"][0])
+    resp = await plugin.api_state()
+    check("概览接口返回气氛统计", "atmosphere_levels" in resp.payload)
+
+    print("\n== 18. 数据库迁移 ==")
     import sqlite3 as _sqlite3
 
     db_path = plugin.store.db_path
@@ -1100,6 +1193,8 @@ async def main() -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
     conn.close()
     check("sessions 表含 proactive_replies 列", "proactive_replies" in cols)
+    check("sessions 表含 atmosphere_level 列", "atmosphere_level" in cols)
+    check("sessions 表含 atmosphere_data 列", "atmosphere_data" in cols)
 
     shutil.rmtree(tmp, ignore_errors=True)
 

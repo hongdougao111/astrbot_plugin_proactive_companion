@@ -10,6 +10,8 @@ desc: |
   **核心能力**
 
   - **主动消息**：后台定时巡检会话，在满足条件时主动开口，私聊与群聊均支持
+  - **读空气**：自动判断群里气氛（冷清 / 正常 / 热闹 / 紧张），冷清时暖场、热闹时不抢话、
+    气氛僵持时彻底闭嘴
   - **主动回复**：在机器人本来不会回复的消息上，按「回复概率」和白名单主动接话，
     走正常 LLM 链路，语气人设与被 @ 时完全一致
   - **上下文感知**：记录每个会话的近期对话，并结合 AstrBot 自身的会话历史生成话题
@@ -21,6 +23,16 @@ desc: |
 
   **指令**：`/陪伴 开启`、`/陪伴 关闭`、`/陪伴 状态`、`/陪伴 说说`、`/陪伴 诊断`、`/陪伴 清空`
 
+  **v1.0.3 更新说明**
+
+  - **新增「读空气」**：根据会话最近的发言算出气氛等级——冷清 / 正常 / 热闹 / 紧张，
+    并据此调整行为：冷清时主动暖场（概率放大、允许更早开口）、热闹时大幅降低插嘴概率、
+    出现争执或攻击性措辞时彻底闭嘴。判断依据包含发言频率、参与人数、情绪倾向和冲突密度。
+  - 气氛会写进提示词，机器人知道「现在群里什么气氛」，接话更合时宜。
+  - WebUI 会话列表新增「气氛」列，概览新增气氛分布统计；`/陪伴 诊断` 也会显示气氛。
+  - 新增配置：`atmosphere_enabled`、`atmosphere_window_minutes`、`atmosphere_refresh_minutes`、
+    `atmosphere_cold_rate`、`atmosphere_hot_rate`、`atmosphere_conflict_ratio`、`atmosphere_boost`。
+
   **v1.0.2 更新说明**
 
   - 修复：主动回复一直不触发——原判定用了 `is_wake`，而 AstrBot 里任何插件的监听器
@@ -31,7 +43,7 @@ desc: |
     **临时上下文**注入本次 LLM 请求（不写入会话历史）。
   - 白名单语义调整：留空 = 不限制；`proactive_reply_enabled` 默认开启，概率默认 0.2。
   - 新增 `/陪伴 诊断` 指令与面板「最近判定 / 跳过原因」，几秒内可定位为什么没触发。
-version: 1.0.2
+version: 1.0.3
 author: hongdougao111
 repo: https://github.com/hongdougao111/astrbot_plugin_proactive_companion
 social_link: https://github.com/hongdougao111

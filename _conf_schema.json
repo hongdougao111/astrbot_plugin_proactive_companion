@@ -182,5 +182,47 @@
     "type": "int",
     "default": 200,
     "hint": "限制被动采集的会话数量，避免在很多群里无限增长。"
+  },
+  "atmosphere_enabled": {
+    "description": "启用读空气（气氛感知）",
+    "type": "bool",
+    "default": true,
+    "hint": "根据群里的活跃度、情绪和冲突情况判断气氛，决定该不该插嘴、该不该暖场。"
+  },
+  "atmosphere_window_minutes": {
+    "description": "气氛判断窗口（分钟）",
+    "type": "int",
+    "default": 30,
+    "hint": "用最近这段时间内的发言来判断气氛。"
+  },
+  "atmosphere_refresh_minutes": {
+    "description": "气氛刷新间隔（分钟）",
+    "type": "int",
+    "default": 3,
+    "hint": "每隔多久重新算一次气氛。"
+  },
+  "atmosphere_cold_rate": {
+    "description": "冷清阈值（条/分钟）",
+    "type": "float",
+    "default": 0.12,
+    "hint": "发言频率低于此值算「冷清」，此时允许更早暖场、也更容易主动接话。"
+  },
+  "atmosphere_hot_rate": {
+    "description": "热闹阈值（条/分钟）",
+    "type": "float",
+    "default": 0.8,
+    "hint": "发言频率高于此值算「热闹」，此时大幅降低主动插嘴的概率。"
+  },
+  "atmosphere_conflict_ratio": {
+    "description": "紧张阈值（冲突占比）",
+    "type": "float",
+    "default": 0.15,
+    "hint": "争执、攻击性措辞的占比高于此值算「紧张」，此时完全不出声。"
+  },
+  "atmosphere_boost": {
+    "description": "冷场时概率放大倍数",
+    "type": "float",
+    "default": 1.5,
+    "hint": "气氛冷清时，主动回复的概率乘以该倍数。"
   }
 }

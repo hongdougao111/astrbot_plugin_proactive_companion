@@ -10,6 +10,8 @@
 | 能力 | 说明 |
 | --- | --- |
 | 🗣️ 主动消息 | 定时检查会话，在满足条件时主动开口，私聊与群聊都支持 |
+| 🌬️ 读空气 | 自动判断群里的气氛（冷清/正常/热闹/紧张），冷清时暖场、热闹时不抢话、气氛僵持时闭嘴 |
+| 💬 主动回复 | 在机器人**本来不会回复**的消息上，按「回复概率」+「白名单」主动接话，语气人设与被 @ 时一致 |
 | 🧠 上下文感知 | 记录每个会话的近期对话，并结合 AstrBot 自身的会话历史生成话题 |
 | 💾 持久化数据 | 会话、消息、情绪、事件日志全部落盘到 `data/plugin_data/`，重装插件不丢数据 |
 | 🎭 动态情绪 | valence（愉悦度）/ arousal（唤醒度）双维度情绪，随互动漂移、随时间衰减，并影响语气与发言频率 |
@@ -85,6 +87,13 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 | `proactive_reply_whitelist` | `[]` | 主动回复白名单（用户 ID / 群号 / 会话 ID；`*` = 不限制；留空 = 不允许任何人） |
 | `proactive_reply_cooldown_minutes` | `10` | 同一会话两次主动回复的最小间隔 |
 | `proactive_reply_min_length` | `2` | 触发主动回复的最短消息长度 |
+| `atmosphere_enabled` | `true` | 启用读空气（气氛感知） |
+| `atmosphere_window_minutes` | `30` | 用最近这段时间的发言判断气氛 |
+| `atmosphere_refresh_minutes` | `3` | 气氛多久重算一次 |
+| `atmosphere_cold_rate` | `0.12` | 低于此频率算冷清 |
+| `atmosphere_hot_rate` | `0.8` | 高于此频率算热闹 |
+| `atmosphere_conflict_ratio` | `0.15` | 冲突词占比高于此值算紧张（彻底闭嘴） |
+| `atmosphere_boost` | `1.5` | 冷场时主动回复概率的放大倍数 |
 | `group_enabled` / `private_enabled` | `true` | 是否允许在群聊 / 私聊主动发言 |
 | `mention_only_in_group` | `false` | 群里只有被 @ 过才主动说话 |
 | `mood_enabled` | `true` | 是否启用动态情绪 |
@@ -125,9 +134,28 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 python tests/test_proactive_companion.py
 ```
 
-当前结果：**86 项断言全部通过**。
+当前结果：**103 项断言全部通过**。
 
 ## 📋 更新日志
+
+### v1.0.3
+
+- **新增「读空气」（气氛感知）**：插件会持续给每个会话算一个气氛等级，让机器人**看气氛行事**：
+
+  | 气氛 | 判定 | 行为 |
+  | --- | --- | --- |
+  | 🧊 冷清 | 发言频率低（默认 < 0.12 条/分钟） | 允许更早暖场，主动回复概率 × `atmosphere_boost`（默认 1.5） |
+  | 🙂 正常 | 有来有回但不激烈 | 按原概率正常接话 |
+  | 🔥 热闹 | 发言频率高且人多（默认 ≥ 0.8 条/分钟） | 主动回复概率 × 0.3，不定时主动搭话 |
+  | ⚡ 紧张 | 有争执/攻击性措辞（占比 > 0.15） | **完全闭嘴**，概率归零 |
+
+  判定依据全部来自插件自己采集的消息记录：发言频率、参与人数、正负向情绪词比例、冲突词密度——
+  **不调用 LLM，不额外花钱**。
+- 气氛会写进提示词（`<reply_hint>` 区块），机器人知道现在群里什么气氛，接话更合时宜。
+- WebUI：会话列表新增「气氛」列（悬停看建议），概览新增气氛分布统计；
+  `/陪伴 诊断` 也显示当前气氛和建议。
+- 新增配置：`atmosphere_enabled`、`atmosphere_window_minutes`、`atmosphere_refresh_minutes`、
+  `atmosphere_cold_rate`、`atmosphere_hot_rate`、`atmosphere_conflict_ratio`、`atmosphere_boost`。
 
 ### v1.0.2
 
