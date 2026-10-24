@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "主动陪伴"
+  },
+  "views": {
+    "panel": {
+      "title": "主动陪伴",
+      "description": "管理主动消息的会话、情绪、免打扰时段与运行参数。"
+    }
+  }
+}

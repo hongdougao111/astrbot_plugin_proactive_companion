@@ -1,0 +1,19 @@
+# Ruff 配置：遵循 AstrBot 插件开发规范
+# 插件以"永不因单个错误崩溃"为第一原则，因此保留宽泛的异常捕获。
+
+line-length = 88
+target-version = "py310"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",    # 行长由 formatter 处理
+    "B008",    # 允许在默认值中调用函数
+    "B904",    # 允许在 except 中直接 raise
+    "SIM105",  # 允许使用 contextlib.suppress
+    "SIM108",  # 允许三元表达式
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["E501"]
+"scripts/*" = ["E501"]
