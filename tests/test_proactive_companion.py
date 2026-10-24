@@ -1185,7 +1185,54 @@ async def main() -> None:
     resp = await plugin.api_state()
     check("概览接口返回气氛统计", "atmosphere_levels" in resp.payload)
 
-    print("\n== 18. 数据库迁移 ==")
+    print("\n== 18. 配置类型自愈 ==")
+    # 模拟历史遗留：list 字段被写成字符串
+    broken = MockAstrBotConfig(
+        {
+            "proactive_reply_whitelist": "96460862,12345",
+            "quiet_hours": "23:00-07:30",
+            "proactive_reply_probability": 1,
+        }
+    )
+    fixed = main_mod.ProactiveCompanionPlugin(ctx, broken)
+    wl = fixed.config.get("proactive_reply_whitelist")
+    check(
+        "字符串白名单被自愈为 list",
+        isinstance(wl, list) and wl == ["96460862", "12345"],
+        repr(wl),
+    )
+    check(
+        "字符串免打扰时段被自愈为 list",
+        isinstance(fixed.config.get("quiet_hours"), list),
+        repr(fixed.config.get("quiet_hours")),
+    )
+    check(
+        "int 概率被规整为 float",
+        isinstance(fixed.config.get("proactive_reply_probability"), float),
+        repr(fixed.config.get("proactive_reply_probability")),
+    )
+
+    # 保存接口也要按 schema 规整类型
+    req_save = MockRequest()
+    request_holder["current"] = req_save
+    req_save.set_json(
+        {
+            "config": {
+                "proactive_reply_whitelist": "aaa, bbb ,ccc",
+                "min_idle_minutes": 30,
+            }
+        }
+    )
+    resp = await fixed.api_save_config()
+    check("保存接口返回成功", resp.payload.get("saved") is True)
+    check(
+        "保存后白名单是 list",
+        isinstance(fixed.config.get("proactive_reply_whitelist"), list)
+        and fixed.config.get("proactive_reply_whitelist") == ["aaa", "bbb", "ccc"],
+        repr(fixed.config.get("proactive_reply_whitelist")),
+    )
+
+    print("\n== 19. 数据库迁移 ==")
     import sqlite3 as _sqlite3
 
     db_path = plugin.store.db_path
