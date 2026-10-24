@@ -134,9 +134,20 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 python tests/test_proactive_companion.py
 ```
 
-当前结果：**103 项断言全部通过**。
+当前结果：**108 项断言全部通过**（另有一份发布前体检脚本，覆盖 72 项市场规范/配置类型/包内容检查）。
 
 ## 📋 更新日志
+
+### v1.0.4
+
+- **修复：保存插件配置报「错误的类型 proactive_reply_whitelist：期望是 list，得到了 str」**
+  - 原因：可视化面板把「主动回复白名单」按**字符串**写回配置，而 `_conf_schema.json` 里声明的是 `list`，
+    AstrBot 保存配置时做严格类型校验，于是直接拒绝。
+  - 现在：面板按 `list` 提交（逗号分隔的输入框，提交时拆成数组），保存接口也会**按 schema 自动规整类型**
+    （字符串→数组、`int`→`float` 等），从源头避免脏配置。
+- **新增配置自愈**：插件加载时会检查所有配置项的类型，把历史遗留的不符项（例如字符串形式的 list）
+  自动修正并写回配置文件，**升级后无需手动清理旧配置**。
+- 修正打包流程：交付 zip 不再混入 `.git`、`__pycache__` 等非发布内容。
 
 ### v1.0.3
 
