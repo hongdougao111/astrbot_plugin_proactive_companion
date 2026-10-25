@@ -1515,7 +1515,7 @@ async def main() -> None:
 
     # 23.6 指令仅限管理员使用
     cmds = getattr(plugin.companion, "commands", {})
-    check("指令组下有 10 条子指令", len(cmds) == 10, str(sorted(cmds)))
+    check("指令组下有 11 条子指令", len(cmds) == 11, str(sorted(cmds)))
     non_admin = [
         name
         for name, func in cmds.items()
@@ -1598,6 +1598,132 @@ async def main() -> None:
     text = await plugin._render_profile(new_row or {})
     check("画像含互动概况", "互动概况" in text, text[:200])
     check("画像含速写", "速写" in text, text[:300])
+    prof_req.set_json({})
+
+    print("\n== 25. 一键清除记忆 ==")
+    await plugin.store.ensure_session(
+        aff_umo, aff_umo, "aiocqhttp", "GroupMessage", "测试会话"
+    )
+    # 当前会话：消息 + 画像 + 情绪
+    await plugin.store.add_message(aff_umo, "user", "清一清", "阿宝", "u-aff")
+    await plugin.store.touch_profile(
+        aff_umo, "u-aff", nickname="阿宝", event="user_message"
+    )
+    await plugin.store.update_session(aff_umo, valence=0.5, arousal=0.9)
+    cleared = await plugin.store.clear_session_memory(aff_umo)
+    check("会话消息已清除", cleared["messages"] >= 1, str(cleared))
+    check("会话画像已清除", cleared["profiles"] >= 1, str(cleared))
+    check(
+        "会话消息确实没了",
+        len(await plugin.store.recent_messages(aff_umo, 50)) == 0,
+    )
+    check(
+        "会话画像确实没了",
+        (await plugin.store.get_profile(aff_umo, "u-aff")) is None,
+    )
+    session_after = await plugin.store.get_session(aff_umo)
+    check("会话情绪已重置", float(session_after.get("valence") or 0) == 0.0)
+
+    # 某个人：画像 + 好感度 + 他说过的话
+    await plugin.store.add_message(aff_umo, "user", "我来了", "阿宝", "u-aff")
+    await plugin.store.add_message(aff_umo, "bot", "欢迎", "bot", "")
+    await plugin.store.touch_profile(
+        aff_umo, "u-aff", nickname="阿宝", event="user_message"
+    )
+    await plugin.store.touch_profile(
+        aff_umo, "u-other", nickname="别人", event="user_message"
+    )
+    cleared = await plugin.store.clear_user_memory("u-aff")
+    check("用户画像已清除", cleared["profiles"] == 1, str(cleared))
+    check("用户消息已清除", cleared["messages"] == 1, str(cleared))
+    check(
+        "别人的画像不受影响",
+        (await plugin.store.get_profile(aff_umo, "u-other")) is not None,
+    )
+    check(
+        "只清画像时保留聊天记录",
+        (await plugin.store.clear_user_memory("u-other", keep_messages=True))[
+            "messages"
+        ]
+        == 0,
+    )
+    check(
+        "只清画像时聊天记录还在",
+        len(await plugin.store.recent_messages(aff_umo, 50)) >= 1,
+    )
+
+    # 全部
+    await plugin.store.add_message(aff_umo, "user", "最后一条", "阿宝", "u-aff")
+    cleared = await plugin.store.clear_all_memory()
+    check("全部清除有统计", cleared["messages"] >= 1, str(cleared))
+    check(
+        "全部画像都没了",
+        len(await plugin.store.list_profiles(None)) == 0,
+    )
+
+    # 指令：不带参数 = 当前会话
+    await plugin.store.add_message(aff_umo, "user", "你好", "阿宝", "u-aff")
+    await plugin.store.touch_profile(
+        aff_umo, "u-aff", nickname="阿宝", event="user_message"
+    )
+    res = await mock_await_result(
+        plugin.companion_forget(MockEvent(aff_umo, "陪伴 清除记忆"))
+    )
+    check("清除记忆指令有回复", res is not None and "已清除" in res[1], str(res))
+    check(
+        "当前会话消息确实被清空",
+        len(await plugin.store.recent_messages(aff_umo, 50)) == 0,
+    )
+
+    # 指令：某个人
+    await plugin.store.add_message(aff_umo, "user", "我来了", "阿宝", "u-aff")
+    await plugin.store.touch_profile(
+        aff_umo, "u-aff", nickname="阿宝", event="user_message"
+    )
+    res = await mock_await_result(
+        plugin.companion_forget(MockEvent(aff_umo, "陪伴 清除记忆 u-aff"))
+    )
+    check("清除某人记忆有回复", res is not None and "已清除" in res[1], str(res))
+    check(
+        "某人画像被清除",
+        (await plugin.store.get_profile(aff_umo, "u-aff")) is None,
+    )
+
+    # 指令：只清画像
+    await plugin.store.add_message(aff_umo, "user", "留着这句话", "阿宝", "u-aff")
+    await plugin.store.touch_profile(
+        aff_umo, "u-aff", nickname="阿宝", event="user_message"
+    )
+    res = await mock_await_result(
+        plugin.companion_forget(MockEvent(aff_umo, "陪伴 清除记忆 画像 u-aff"))
+    )
+    check("只清画像有回复", res is not None and "已清除" in res[1], str(res))
+    check(
+        "只清画像后聊天记录保留",
+        len(await plugin.store.recent_messages(aff_umo, 50)) >= 1,
+    )
+    check(
+        "只清画像后画像没了",
+        (await plugin.store.get_profile(aff_umo, "u-aff")) is None,
+    )
+
+    # 指令：全部
+    res = await mock_await_result(
+        plugin.companion_forget(MockEvent(aff_umo, "陪伴 清除记忆 全部"))
+    )
+    check("清除全部有回复", res is not None and "已清除" in res[1], str(res))
+    check(
+        "全部消息被清空",
+        len(await plugin.store.recent_messages(aff_umo, 50)) == 0,
+    )
+
+    # Web API
+    prof_req.set_json({"scope": "session", "session_key": aff_umo})
+    resp = await plugin.api_clear_memory()
+    check("清除记忆接口可用", resp.payload.get("cleared") is True, str(resp.payload))
+    prof_req.set_json({"scope": "bad"})
+    resp = await plugin.api_clear_memory()
+    check("非法 scope 报错", resp.status_code == 400, str(resp.status_code))
     prof_req.set_json({})
 
     shutil.rmtree(tmp, ignore_errors=True)

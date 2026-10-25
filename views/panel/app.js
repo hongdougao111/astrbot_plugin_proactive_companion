@@ -192,6 +192,7 @@ async function loadSessions() {
             <button class="btn tiny ghost" data-act="send">立即发送</button>
             <button class="btn tiny ghost" data-act="mood">重置情绪</button>
             <button class="btn tiny ghost" data-act="messages">记录</button>
+            <button class="btn tiny ghost danger" data-act="clear-memory">清记忆</button>
             <button class="btn tiny ghost danger" data-act="delete">删除</button>
           </div>
         </td>
@@ -218,6 +219,13 @@ async function sessionAction(key, act, btn) {
     } else if (act === "messages") {
       await loadMessages(key);
       return;
+    } else if (act === "clear-memory") {
+      const r = await bridge.apiPost("memory/clear", {
+        scope: "session",
+        session_key: key,
+      });
+      const d = r.detail || {};
+      toast(`已清除该会话记忆（${d.messages ?? 0} 条消息、${d.profiles ?? 0} 份画像）`);
     } else if (act === "delete") {
       await bridge.apiPost("sessions/delete", { session_key: key });
       toast("会话数据已删除");
@@ -279,6 +287,7 @@ async function loadProfiles() {
           p.level
         )}">${esc(p.level)} ${p.affection.toFixed(1)} <span class="muted">${bar}</span></span>
             <button class="btn tiny ghost" data-act="edit-profile">编辑</button>
+            <button class="btn tiny ghost danger" data-act="forget">遗忘此人</button>
           </div>
           <div class="profile-summary">${esc(p.summary || "")}</div>
           ${tags ? `<div class="profile-tags">${tags}</div>` : ""}
@@ -483,8 +492,8 @@ function bindActions() {
     if (key) sessionAction(key, btn.dataset.act, btn);
   });
 
-  $("#profile-list").addEventListener("click", (ev) => {
-    const btn = ev.target.closest("button[data-act='edit-profile']");
+  $("#profile-list").addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("button[data-act]");
     if (!btn) return;
     const card = btn.closest("[data-key]");
     const key = card?.dataset.key;
@@ -492,7 +501,29 @@ function bindActions() {
     const profile = state.profiles.find(
       (p) => p.session_key === key && p.user_id === user
     );
-    if (profile) openProfileEditor(profile);
+    if (!profile) return;
+    if (btn.dataset.act === "forget") {
+      btn.disabled = true;
+      try {
+        const r = await bridge.apiPost("memory/clear", {
+          scope: "user",
+          user_id: profile.user_id,
+        });
+        const d = r.detail || {};
+        toast(
+          `已遗忘 ${profile.nickname || profile.user_id}（${d.messages ?? 0} 条消息、${
+            d.profiles ?? 0
+          } 份画像）`
+        );
+        await Promise.all([loadProfiles(), loadState()]);
+      } catch (err) {
+        toast(err.message || "清除失败", true);
+      } finally {
+        btn.disabled = false;
+      }
+      return;
+    }
+    if (btn.dataset.act === "edit-profile") openProfileEditor(profile);
   });
 
   $("#btn-save-profile").addEventListener("click", saveProfile);
@@ -509,6 +540,44 @@ function bindActions() {
         toast(err.message || "补全失败", true);
       } finally {
         rebuildBtn.disabled = false;
+      }
+    });
+  }
+
+  const clearProfilesBtn = $("#btn-clear-profiles");
+  if (clearProfilesBtn) {
+    clearProfilesBtn.addEventListener("click", async () => {
+      clearProfilesBtn.disabled = true;
+      try {
+        const r = await bridge.apiPost("memory/clear", { scope: "profiles" });
+        const d = r.detail || {};
+        toast(`已清除 ${d.profiles ?? 0} 份画像与好感度（聊天记录保留）`);
+        await loadProfiles();
+      } catch (err) {
+        toast(err.message || "清除失败", true);
+      } finally {
+        clearProfilesBtn.disabled = false;
+      }
+    });
+  }
+
+  const clearAllBtn = $("#btn-clear-all");
+  if (clearAllBtn) {
+    clearAllBtn.addEventListener("click", async () => {
+      const ok = window.confirm(
+        "确定清空所有会话的记忆吗？\n聊天记录、人物画像、好感度都会被删除，且无法恢复。"
+      );
+      if (!ok) return;
+      clearAllBtn.disabled = true;
+      try {
+        const r = await bridge.apiPost("memory/clear", { scope: "all" });
+        const d = r.detail || {};
+        toast(`已清空全部记忆（${d.messages ?? 0} 条消息、${d.profiles ?? 0} 份画像）`);
+        await Promise.all([loadProfiles(), loadSessions(), loadState()]);
+      } catch (err) {
+        toast(err.message || "清除失败", true);
+      } finally {
+        clearAllBtn.disabled = false;
       }
     });
   }

@@ -1767,15 +1767,160 @@ class ProactiveCompanionPlugin(Star):
     async def companion_clear(self, event: AstrMessageEvent):
         """清空当前会话的记忆与情绪"""
         umo = event.unified_msg_origin
-        await self.store.update_session(
-            umo,
-            valence=0.0,
-            arousal=emotion.BASE_AROUSAL,
-            mood_updated_at=time.time(),
-            last_msg_at=0.0,
-        )
+        cleared = await self._clear_memory("session", session_key=umo)
         await self.store.add_event("session_cleared", umo)
-        yield event.plain_result("已经忘记之前聊过的东西啦，重新认识一下吧！")
+        yield event.plain_result(
+            f"已经忘记之前聊过的东西啦，重新认识一下吧！"
+            f"（清掉 {int(cleared.get('messages') or 0)} 条聊天记录、"
+            f"{int(cleared.get('profiles') or 0)} 份画像）"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @companion.command(
+        "清除记忆",
+        alias={"clear-memory", "forget", "忘记", "忘一忘", "清记忆", "purge"},
+    )
+    async def companion_forget(self, event: AstrMessageEvent):
+        """一键清除记忆
+
+        用法：
+        /陪伴 清除记忆              清空当前会话（聊天记录 + 画像 + 情绪）
+        /陪伴 清除记忆 阿宝          忘掉某个人（画像 + 好感度 + 他说过的话）
+        /陪伴 清除记忆 全部          清空所有会话的记忆
+        /陪伴 清除记忆 画像 阿宝     只清某人的画像与好感度（保留聊天记录）
+        /陪伴 清除记忆 画像 全部     只清所有画像与好感度（保留聊天记录）
+        """
+        umo = event.unified_msg_origin
+        tail = self._cmd_tail(
+            event, "清除记忆", "clear-memory", "forget", "忘记", "忘一忘", "清记忆"
+        )
+        scope = "session"
+        target = ""
+        keep_messages = False
+        parts = tail.split(" ") if tail else []
+        parts = [p for p in parts if p]
+        if parts:
+            head = parts[0]
+            if head in ("全部", "all", "所有"):
+                scope = "all"
+            elif head in ("画像", "profile", "档案"):
+                scope = "profiles"
+                if len(parts) > 1 and parts[1] not in ("全部", "all", "所有"):
+                    target = parts[1]
+            elif head in ("会话", "session", "本会话"):
+                scope = "session"
+            else:
+                scope = "user"
+                target = head
+        if scope == "user":
+            resolved = await self._resolve_profile(umo, target)
+            if resolved is None:
+                yield event.plain_result(
+                    f"没有找到「{target}」的记忆，换个昵称或用户 ID 试试～"
+                )
+                return
+            _, user_id = resolved
+        elif scope == "profiles" and target:
+            resolved = await self._resolve_profile(umo, target)
+            if resolved is None:
+                yield event.plain_result(
+                    f"没有找到「{target}」的画像，换个昵称或用户 ID 试试～"
+                )
+                return
+            _, user_id = resolved
+        else:
+            user_id = ""
+        cleared = await self._clear_memory(
+            scope,
+            session_key=umo,
+            user_id=user_id,
+            keep_messages=keep_messages,
+        )
+        messages = int(cleared.get("messages") or 0)
+        profiles = int(cleared.get("profiles") or 0)
+        parts_out = []
+        if messages:
+            parts_out.append(f"{messages} 条聊天记录")
+        if profiles:
+            parts_out.append(f"{profiles} 份人物画像")
+        if scope == "session":
+            detail = "当前会话" + (
+                "、" + "、".join(parts_out) if parts_out else "（本来就是空的）"
+            )
+            extra = "情绪与气氛也已重置。"
+        elif scope == "user":
+            detail = f"「{target}」的记忆" + (
+                "、" + "、".join(parts_out) if parts_out else "（本来就是空的）"
+            )
+            extra = "好感度与画像已清空，机器人会重新认识他。"
+        elif scope == "profiles":
+            who = f"「{target}」的" if target else "所有人的"
+            detail = (
+                who
+                + "画像与好感度"
+                + ("、" + "、".join(parts_out) if parts_out else "（本来就是空的）")
+            )
+            extra = "聊天记录保留。"
+        else:
+            detail = "所有会话的记忆" + (
+                "、" + "、".join(parts_out) if parts_out else "（本来就是空的）"
+            )
+            extra = "情绪与气氛已重置。"
+        await self.store.add_event(
+            "memory_cleared", umo, {"scope": scope, "user_id": user_id}
+        )
+        yield event.plain_result(f"已清除{detail}。{extra}")
+
+    async def _clear_memory(
+        self,
+        scope: str,
+        *,
+        session_key: str = "",
+        user_id: str = "",
+        keep_messages: bool = False,
+    ) -> dict[str, int]:
+        """执行清除记忆，返回删除统计（同时清理内存里的好感度缓存）。"""
+        if scope == "session":
+            cleared = await self.store.clear_session_memory(
+                session_key, base_arousal=emotion.BASE_AROUSAL
+            )
+            self._affection_cache = {
+                key: value
+                for key, value in self._affection_cache.items()
+                if not key.startswith(f"{session_key}|")
+            }
+            return cleared
+        if scope == "user":
+            cleared = await self.store.clear_user_memory(
+                user_id, keep_messages=keep_messages
+            )
+            self._affection_cache = {
+                key: value
+                for key, value in self._affection_cache.items()
+                if not key.endswith(f"|{user_id}")
+            }
+            return cleared
+        if scope == "profiles":
+            if user_id:
+                cleared = await self.store.clear_user_memory(
+                    user_id, keep_messages=True
+                )
+                self._affection_cache = {
+                    key: value
+                    for key, value in self._affection_cache.items()
+                    if not key.endswith(f"|{user_id}")
+                }
+                return cleared
+            cleared = await self.store.clear_all_memory(
+                keep_messages=True, base_arousal=emotion.BASE_AROUSAL, reset_mood=False
+            )
+            self._affection_cache.clear()
+            return cleared
+        cleared = await self.store.clear_all_memory(
+            keep_messages=keep_messages, base_arousal=emotion.BASE_AROUSAL
+        )
+        self._affection_cache.clear()
+        return cleared
 
     # ------------------------------------------------------------------
     # 工具方法
@@ -1890,6 +2035,47 @@ class ProactiveCompanionPlugin(Star):
             ["POST"],
             "用历史聊天记录重建人物画像",
         )
+        ctx.register_web_api(
+            f"/{PLUGIN_NAME}/memory/clear",
+            self.api_clear_memory,
+            ["POST"],
+            "一键清除记忆（会话 / 某人 / 全部 / 只清画像）",
+        )
+
+    async def api_clear_memory(self):
+        """一键清除记忆。
+
+        scope 取值：
+        - session：清空某个会话的记忆（聊天记录 + 画像 + 情绪）
+        - user：忘掉某个人（画像 + 好感度 + 他说过的话）
+        - profiles：只清画像与好感度，保留聊天记录
+        - all：清空所有会话的记忆
+        """
+        payload = await request.json(default={})
+        scope = str(payload.get("scope") or "session").strip()
+        session_key = str(payload.get("session_key") or "").strip()
+        user_id = str(payload.get("user_id") or "").strip()
+        keep_messages = bool(payload.get("keep_messages"))
+        if scope == "session" and not session_key:
+            return error_response("缺少 session_key")
+        if scope in ("user", "profiles") and not user_id:
+            return error_response("缺少 user_id")
+        if scope not in ("session", "user", "profiles", "all"):
+            return error_response("scope 只能是 session / user / profiles / all")
+        try:
+            cleared = await self._clear_memory(
+                scope,
+                session_key=session_key,
+                user_id=user_id,
+                keep_messages=keep_messages,
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"[主动陪伴] 清除记忆失败: {exc}")
+            return error_response(f"清除失败：{exc}", status_code=500)
+        await self.store.add_event(
+            "memory_cleared", session_key, {"scope": scope, "user_id": user_id}
+        )
+        return json_response({"cleared": True, "scope": scope, "detail": cleared})
 
     async def api_rebuild_profiles(self):
         """用历史聊天记录回填人物画像。"""

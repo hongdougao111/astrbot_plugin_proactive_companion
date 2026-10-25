@@ -842,6 +842,83 @@ class Store:
 
         return await self._run(_do)
 
+    # ------------------------------------------------------------------
+    # 一键清除记忆
+    # ------------------------------------------------------------------
+    async def clear_session_memory(
+        self, session_key: str, base_arousal: float = 0.5, reset_mood: bool = True
+    ) -> dict[str, int]:
+        """清除某个会话的记忆。
+
+        删除该会话的聊天记录与人物画像，并把情绪、气氛快照重置。
+        统计数据（主动消息次数、每日额度）保留，避免被当成绕过限流的手段。
+        """
+
+        def _do(conn: sqlite3.Connection) -> dict[str, int]:
+            messages = conn.execute(
+                "DELETE FROM messages WHERE session_key = ?", (session_key,)
+            ).rowcount
+            profiles = conn.execute(
+                "DELETE FROM user_profiles WHERE session_key = ?", (session_key,)
+            ).rowcount
+            if reset_mood:
+                conn.execute(
+                    "UPDATE sessions SET valence = 0.0, arousal = ?, mood_updated_at = ?,"
+                    " last_msg_at = 0.0, atmosphere_level = '', atmosphere_data = '',"
+                    " atmosphere_updated_at = 0.0 WHERE session_key = ?",
+                    (base_arousal, time.time(), session_key),
+                )
+            return {"messages": messages, "profiles": profiles}
+
+        return await self._run(_do)
+
+    async def clear_user_memory(
+        self, user_id: str, keep_messages: bool = False
+    ) -> dict[str, int]:
+        """清除某个人的记忆。
+
+        删除该用户在所有会话里的画像（昵称、标签、备注、好感度）。
+        keep_messages 为 False 时，一并删除他说过的话；机器人自己的发言保留。
+        """
+        user_id = (user_id or "").strip()
+
+        def _do(conn: sqlite3.Connection) -> dict[str, int]:
+            profiles = conn.execute(
+                "DELETE FROM user_profiles WHERE user_id = ?", (user_id,)
+            ).rowcount
+            messages = 0
+            if not keep_messages:
+                messages = conn.execute(
+                    "DELETE FROM messages WHERE sender_id = ?", (user_id,)
+                ).rowcount
+            return {"messages": messages, "profiles": profiles}
+
+        return await self._run(_do)
+
+    async def clear_all_memory(
+        self,
+        keep_messages: bool = False,
+        base_arousal: float = 0.5,
+        reset_mood: bool = True,
+    ) -> dict[str, int]:
+        """清除全部记忆（所有会话）。"""
+
+        def _do(conn: sqlite3.Connection) -> dict[str, int]:
+            profiles = conn.execute("DELETE FROM user_profiles").rowcount
+            messages = 0
+            if not keep_messages:
+                messages = conn.execute("DELETE FROM messages").rowcount
+            if reset_mood:
+                conn.execute(
+                    "UPDATE sessions SET valence = 0.0, arousal = ?, mood_updated_at = ?,"
+                    " last_msg_at = 0.0, atmosphere_level = '', atmosphere_data = '',"
+                    " atmosphere_updated_at = 0.0",
+                    (base_arousal, time.time()),
+                )
+            return {"messages": messages, "profiles": profiles}
+
+        return await self._run(_do)
+
     async def recent_user_messages(
         self, session_key: str, user_id: str, limit: int = 5
     ) -> list[dict[str, Any]]:
