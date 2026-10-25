@@ -1523,6 +1523,83 @@ async def main() -> None:
     ]
     check("所有指令都限制为管理员", not non_admin, str(non_admin))
 
+    print("\n== 24. 画像按人合并与同步写入 ==")
+    prof_req = MockRequest()
+    request_holder["current"] = prof_req
+    prof_req.set_query()
+    # 同一个用户在两个会话里各有一份画像
+    await plugin.store.touch_profile(
+        "aiocqhttp:GroupMessage:g1", "u-duo", nickname="多多", event="user_message"
+    )
+    await plugin.store.touch_profile(
+        "aiocqhttp:FriendMessage:f1", "u-duo", nickname="多多", event="user_message"
+    )
+    resp = await plugin.api_profiles()
+    items = resp.payload["profiles"]
+    duo = [p for p in items if p["user_id"] == "u-duo"]
+    check("同一个人合并成一条画像", len(duo) == 1, str([p["user_id"] for p in items]))
+    check("合并后统计到会话数", duo and duo[0]["session_count"] == 2, str(duo))
+    check("合并后消息数相加", duo and duo[0]["msg_count"] == 2, str(duo))
+    check("画像带人物速写", duo and bool(duo[0].get("summary")), str(duo))
+    check("画像带聊天足迹字段", duo and "recent_messages" in duo[0], str(duo))
+
+    # 面板保存 → 所有会话同步
+    prof_req.set_json(
+        {
+            "session_key": "aiocqhttp:GroupMessage:g1",
+            "user_id": "u-duo",
+            "nickname": "多多名",
+            "tags": "同事,话痨",
+            "affection": 55,
+            "note": "很爱聊",
+        }
+    )
+    resp = await plugin.api_update_profile()
+    check("面板保存成功", resp.payload.get("saved") is True, str(resp.payload))
+    check(
+        "保存返回同步的会话数",
+        (resp.payload.get("applied") or {}).get("sessions") == 2,
+        str(resp.payload.get("applied")),
+    )
+    rows = await plugin.store.user_profile_sessions("u-duo")
+    check(
+        "所有会话昵称都同步",
+        all(r.get("nickname") == "多多名" for r in rows),
+        str(rows),
+    )
+    check("所有会话备注都同步", all(r.get("note") == "很爱聊" for r in rows), str(rows))
+    check(
+        "所有会话好感度都同步",
+        all(float(r.get("affection") or 0) == 55.0 for r in rows),
+        str(rows),
+    )
+    check(
+        "所有会话标签都同步",
+        all("话痨" in str(r.get("tags") or "") for r in rows),
+        str(rows),
+    )
+
+    # 没有画像行的人 → 自动补一份
+    prof_req.set_json(
+        {
+            "session_key": "aiocqhttp:FriendMessage:new",
+            "user_id": "u-new",
+            "note": "新来的",
+        }
+    )
+    resp = await plugin.api_update_profile()
+    check(
+        "不存在的画像会自动创建", resp.payload.get("saved") is True, str(resp.payload)
+    )
+    new_row = await plugin.store.get_profile("aiocqhttp:FriendMessage:new", "u-new")
+    check("新画像已落库", (new_row or {}).get("note") == "新来的", str(new_row))
+
+    # 画像渲染包含互动概况与速写
+    text = await plugin._render_profile(new_row or {})
+    check("画像含互动概况", "互动概况" in text, text[:200])
+    check("画像含速写", "速写" in text, text[:300])
+    prof_req.set_json({})
+
     shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n" + "=" * 52)

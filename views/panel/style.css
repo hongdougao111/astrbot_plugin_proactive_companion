@@ -513,3 +513,64 @@ td.name {
     align-items: flex-start;
   }
 }
+
+/* ---------------- 人物画像卡片 ---------------- */
+.profile-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.profile-card .profile-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.profile-card .profile-name {
+  font-size: 14px;
+  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
+}
+
+.profile-card .profile-summary {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.profile-card .profile-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.profile-card .profile-tags .tag {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 99px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.profile-card .profile-stat,
+.profile-card .profile-foot {
+  margin-top: 4px;
+  line-height: 1.5;
+}
+
+.profile-card .profile-note {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  word-break: break-word;
+}

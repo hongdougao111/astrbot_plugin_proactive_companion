@@ -138,6 +138,46 @@ def _now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _safe_json_list(raw: Any) -> list[Any]:
+    """安全解析标签数组，坏数据不炸。"""
+    if isinstance(raw, list):
+        return list(raw)
+    try:
+        data = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _profile_summary(item: dict[str, Any]) -> str:
+    """生成一句话人物速写。"""
+    name = str(item.get("nickname") or item.get("user_id") or "这个人")
+    level = str(item.get("level") or "")
+    msg_count = int(item.get("msg_count") or 0)
+    bot_replies = int(item.get("bot_replies") or 0)
+    session_count = int(item.get("session_count") or 1)
+    parts = [f"{name}·{level}" if level else name]
+    if msg_count:
+        parts.append(f"聊过 {msg_count} 条，机器人接了 {bot_replies} 次")
+    if session_count > 1:
+        parts.append(f"在 {session_count} 个会话里活跃")
+    tags = item.get("tags") or []
+    if tags:
+        parts.append("标签：" + "、".join(str(t) for t in tags))
+    recent = item.get("recent_messages") or []
+    if recent:
+        last = str(recent[-1].get("content") or "").replace("\n", " ").strip()
+        if len(last) > 20:
+            last = last[:20] + "…"
+        parts.append(f"最近提到「{last}」")
+    note = str(item.get("note") or "").replace("\n", " ").strip()
+    if note:
+        if len(note) > 30:
+            note = note[:30] + "…"
+        parts.append(f"备注：{note}")
+    return " ｜ ".join(parts)
+
+
 class ProactiveCompanionPlugin(Star):
     """主动陪伴插件主体。"""
 
@@ -167,6 +207,18 @@ class ProactiveCompanionPlugin(Star):
         global _PLUGIN_REF
         _PLUGIN_REF = self
         self._register_web_apis()
+
+    @staticmethod
+    def _plugin_version() -> str:
+        """读取插件版本号（诊断信息里用）。"""
+        path = Path(__file__).resolve().parent / "metadata.yaml"
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("version:"):
+                    return line.split(":", 1)[1].strip().strip("'\"")
+        except Exception:  # pragma: no cover
+            pass
+        return "未知"
 
     def _schema(self) -> dict[str, Any]:
         """读取 _conf_schema.json，用于按类型规整配置值。"""
@@ -1388,6 +1440,34 @@ class ProactiveCompanionPlugin(Star):
             lines.append(f"建议：{state.advice}")
         else:
             lines.append("气氛：暂无数据（读空气已关闭或还没算过）")
+        # 画像相关的信息：方便确认「改了为什么没生效」
+        try:
+            all_profiles = await self.store.list_profiles(None)
+        except Exception:  # pragma: no cover
+            all_profiles = []
+        people = {str(p.get("user_id") or "") for p in all_profiles}
+        lines.append("——")
+        lines.append(f"插件版本：{self._plugin_version()}")
+        lines.append(f"数据库文件：{self.store.db_path}")
+        lines.append(
+            f"画像：{len(all_profiles)} 行 / {len(people)} 个人"
+            f"（同一个人在多个会话里会各有一行，保存时会同步）"
+        )
+        try:
+            self_id = str(event.get_sender_id() or "")
+        except Exception:
+            self_id = ""
+        if self_id:
+            rows = await self.store.user_profile_sessions(self_id)
+            if rows:
+                for row in rows[:3]:
+                    lines.append(
+                        f"你的画像[{row.get('session_key')}｜{row.get('nickname') or '—'}]："
+                        f"好感 {row.get('affection')}｜标签 {row.get('tags') or '[]'}｜"
+                        f"备注 {row.get('note') or '—'}｜手动昵称 {row.get('nickname_manual')}"
+                    )
+            else:
+                lines.append("你的画像：暂无记录")
         yield event.plain_result("\n".join(lines))
 
     # ------------------------------------------------------------------
@@ -1583,22 +1663,26 @@ class ProactiveCompanionPlugin(Star):
                 "没看懂要改什么。可用字段：备注=xxx 标签=a,b 好感=60 昵称=xxx"
             )
             return
-        profile = await self.store.update_profile_fields(
-            skey,
+        profile = await self.store.update_profile_fields_by_user(
             uid,
+            skey,
             note=note,
             tags=tags,
             affection=affection_value,
             nickname=nickname,
         )
-        if profile is None:
+        if not profile:
             yield event.plain_result("没找到这个人的画像，先聊两句试试～")
             return
         if affection_value is not None:
-            self._affection_cache[self._affection_key(skey, uid)] = float(
-                profile.get("affection") or 0.0
-            )
-        yield event.plain_result("已更新画像：\n" + await self._render_profile(profile))
+            for row in profile:
+                self._affection_cache[
+                    self._affection_key(str(row.get("session_key") or ""), uid)
+                ] = float(row.get("affection") or 0.0)
+        extra = f"（已同步到 {len(profile)} 个会话）" if len(profile) > 1 else ""
+        yield event.plain_result(
+            f"已更新画像{extra}：\n" + await self._render_profile(profile[0])
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("重建画像", alias={"rebuild", "回填画像"})
@@ -1615,25 +1699,26 @@ class ProactiveCompanionPlugin(Star):
         )
 
     async def _render_profile(self, profile: dict[str, Any]) -> str:
-        """把一条画像渲染成可读文本。"""
+        """把一条画像渲染成可读文本（含互动概况与人物速写）。"""
         session_key = str(profile.get("session_key") or "")
         user_id = str(profile.get("user_id") or "")
         score = await self._affection_of(session_key, user_id)
         level = affection.level_of(score)
-        try:
-            tags = json.loads(profile.get("tags") or "[]")
-        except (TypeError, ValueError):
-            tags = []
+        tags = _safe_json_list(profile.get("tags"))
         nickname = str(profile.get("nickname") or "") or "（未设置昵称）"
         first_seen = float(profile.get("first_seen") or 0)
         last_seen = float(profile.get("last_seen") or 0)
+        msg_count = int(profile.get("msg_count") or 0)
+        bot_replies = int(profile.get("bot_replies") or 0)
         fmt = "%Y-%m-%d %H:%M"
+        # 互动概况：回复率能看出这个人有多爱聊
+        ratio = (bot_replies / msg_count * 100) if msg_count else 0.0
         lines = [
             f"人物画像：{nickname}",
             f"用户 ID：{user_id}",
             f"好感度：{score:.1f} / 100（{level}）",
-            f"互动：{int(profile.get('msg_count') or 0)} 条消息，"
-            f"机器人回应 {int(profile.get('bot_replies') or 0)} 次",
+            f"互动概况：{msg_count} 条消息 · 机器人回应 {bot_replies} 次"
+            f"（回应率 {ratio:.0f}%）",
             f"首次出现：{time.strftime(fmt, time.localtime(first_seen)) if first_seen else '—'}",
             f"最近出现：{time.strftime(fmt, time.localtime(last_seen)) if last_seen else '—'}",
         ]
@@ -1643,7 +1728,7 @@ class ProactiveCompanionPlugin(Star):
         lines.append("备注：" + (note if note else "（暂无）"))
         # 聊天足迹：把这个人最近说过的话也带进画像
         try:
-            recent = await self.store.recent_user_messages(session_key, user_id, 5)
+            recent = await self.store.recent_messages_by_user(user_id, 5)
         except Exception:  # pragma: no cover
             recent = []
         if recent:
@@ -1659,6 +1744,22 @@ class ProactiveCompanionPlugin(Star):
                     time.strftime("%m-%d %H:%M", time.localtime(stamp)) if stamp else ""
                 )
                 lines.append(f"  · [{when}] {content}")
+        # 一句话人物速写
+        summary = _profile_summary(
+            {
+                "nickname": nickname,
+                "user_id": user_id,
+                "level": level,
+                "tags": tags,
+                "note": note,
+                "msg_count": msg_count,
+                "bot_replies": bot_replies,
+                "recent_messages": [
+                    {"content": str(m.get("content") or "")} for m in recent
+                ],
+            }
+        )
+        lines.append("速写：" + summary)
         return "\n".join(lines)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1800,34 +1901,75 @@ class ProactiveCompanionPlugin(Star):
         return json_response({"rebuilt": count})
 
     async def api_profiles(self):
-        """人物画像列表（含好感度）。"""
+        """人物画像列表（按人合并，跨会话汇总）。"""
         session_key = (request.query.get("session_key") or "").strip() or None
         profiles = await self.store.list_profiles(session_key)
-        items = []
-        for profile in profiles:
-            skey = str(profile.get("session_key") or "")
-            uid = str(profile.get("user_id") or "")
-            score = await self._affection_of(skey, uid)
-            try:
-                tags = json.loads(profile.get("tags") or "[]")
-            except (TypeError, ValueError):
-                tags = []
-            items.append(
-                {
-                    "session_key": skey,
+        merged: dict[str, dict[str, Any]] = {}
+        for row in profiles:
+            uid = str(row.get("user_id") or "")
+            if not uid:
+                continue
+            row_session = str(row.get("session_key") or "")
+            row_last = float(row.get("last_seen") or 0)
+            tags = _safe_json_list(row.get("tags"))
+            item = merged.get(uid)
+            if item is None:
+                merged[uid] = {
+                    "session_key": row_session,
                     "user_id": uid,
-                    "nickname": profile.get("nickname") or "",
-                    "affection": round(score, 2),
-                    "level": affection.level_of(score),
-                    "level_index": affection.level_index(score),
+                    "nickname": row.get("nickname") or "",
+                    "affection": float(row.get("affection") or 0.0),
                     "tags": tags,
-                    "note": profile.get("note") or "",
-                    "msg_count": int(profile.get("msg_count") or 0),
-                    "bot_replies": int(profile.get("bot_replies") or 0),
-                    "first_seen": float(profile.get("first_seen") or 0),
-                    "last_seen": float(profile.get("last_seen") or 0),
+                    "note": row.get("note") or "",
+                    "msg_count": int(row.get("msg_count") or 0),
+                    "bot_replies": int(row.get("bot_replies") or 0),
+                    "first_seen": float(row.get("first_seen") or 0),
+                    "last_seen": row_last,
+                    "session_count": 1,
+                    "sessions": [row_session],
                 }
-            )
+                continue
+            # 同一个人：合并各项统计，昵称/备注取最近活跃的那份
+            item["session_count"] += 1
+            item["sessions"].append(row_session)
+            item["msg_count"] += int(row.get("msg_count") or 0)
+            item["bot_replies"] += int(row.get("bot_replies") or 0)
+            first_seen = float(row.get("first_seen") or 0)
+            if first_seen and (
+                item["first_seen"] <= 0 or first_seen < item["first_seen"]
+            ):
+                item["first_seen"] = first_seen
+            if row_last >= item["last_seen"]:
+                item["last_seen"] = row_last
+                item["session_key"] = row_session
+                item["affection"] = float(row.get("affection") or 0.0)
+                item["nickname"] = row.get("nickname") or item["nickname"]
+            if not item["tags"] and tags:
+                item["tags"] = tags
+            if not item["note"] and row.get("note"):
+                item["note"] = row.get("note")
+        items: list[dict[str, Any]] = []
+        for item in merged.values():
+            score = await self._affection_of(item["session_key"], item["user_id"])
+            item["affection"] = round(score, 2)
+            item["level"] = affection.level_of(score)
+            item["level_index"] = affection.level_index(score)
+            try:
+                recent = await self.store.recent_messages_by_user(item["user_id"], 3)
+            except Exception:  # pragma: no cover
+                recent = []
+            item["recent_messages"] = [
+                {
+                    "content": str(m.get("content") or ""),
+                    "ts": float(m.get("ts") or 0),
+                    "session_key": str(m.get("session_key") or ""),
+                }
+                for m in recent
+                if str(m.get("content") or "").strip()
+            ]
+            item["summary"] = _profile_summary(item)
+            items.append(item)
+        items.sort(key=lambda x: float(x.get("affection") or 0), reverse=True)
         return json_response({"profiles": items, "total": len(items)})
 
     async def api_profile_detail(self):
@@ -1852,12 +1994,17 @@ class ProactiveCompanionPlugin(Star):
         return json_response({"profile": profile})
 
     async def api_update_profile(self):
-        """修改人物画像：备注 / 标签 / 好感度 / 昵称。"""
+        """修改人物画像：备注 / 标签 / 好感度 / 昵称。
+
+        同一个人可能同时在群聊和私聊里跟机器人说话，之前画像按会话各存一份，
+        只改其中一份的话另一份看起来就像「没生效」。现在统一按 user_id
+        写入所有会话的画像，并在写完后回读校验，把真正落库的结果返回给面板。
+        """
         payload = await request.json(default={})
         session_key = str(payload.get("session_key") or "").strip()
         user_id = str(payload.get("user_id") or "").strip()
-        if not session_key or not user_id:
-            return error_response("缺少 session_key 或 user_id")
+        if not user_id:
+            return error_response("缺少 user_id")
         note = payload.get("note")
         tags = payload.get("tags")
         nickname = payload.get("nickname")
@@ -1869,27 +2016,49 @@ class ProactiveCompanionPlugin(Star):
                 nickname = None
         if isinstance(tags, str):
             tags = [t.strip() for t in tags.replace("，", ",").split(",") if t.strip()]
-        if affection_value is not None:
+        elif isinstance(tags, list):
+            tags = [str(t).strip() for t in tags if str(t).strip()]
+        if affection_value is not None and affection_value != "":
             try:
                 affection_value = float(affection_value)
             except (TypeError, ValueError):
                 return error_response("好感值必须是数字")
-        profile = await self.store.update_profile_fields(
-            session_key,
-            user_id,
-            note=note if isinstance(note, str) else None,
-            tags=tags if isinstance(tags, list) else None,
-            affection=affection_value,
-            nickname=nickname if isinstance(nickname, str) else None,
-        )
-        if profile is None:
-            return error_response("画像不存在", status_code=404)
-        if affection_value is not None:
-            self._affection_cache[self._affection_key(session_key, user_id)] = float(
-                profile.get("affection") or 0.0
+        else:
+            affection_value = None
+        try:
+            profiles = await self.store.update_profile_fields_by_user(
+                user_id,
+                session_key,
+                note=note if isinstance(note, str) else None,
+                tags=tags if isinstance(tags, list) else None,
+                affection=affection_value,
+                nickname=nickname if isinstance(nickname, str) else None,
             )
-        await self.store.add_event("profile_updated", session_key, {"user_id": user_id})
-        return json_response({"saved": True, "profile": profile})
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"[主动陪伴] 写入人物画像失败: {exc}")
+            return error_response(f"写入失败：{exc}", status_code=500)
+        if not profiles:
+            return error_response("画像写入失败：没有匹配的记录", status_code=404)
+        if affection_value is not None:
+            for row in profiles:
+                self._affection_cache[
+                    self._affection_key(str(row.get("session_key") or ""), user_id)
+                ] = float(row.get("affection") or 0.0)
+        # 回读校验：确认要改的字段确实落库了
+        primary = profiles[0]
+        applied = {
+            "nickname": str(primary.get("nickname") or ""),
+            "tags": _safe_json_list(primary.get("tags")),
+            "note": str(primary.get("note") or ""),
+            "affection": round(float(primary.get("affection") or 0.0), 2),
+            "sessions": len(profiles),
+        }
+        await self.store.add_event(
+            "profile_updated",
+            session_key,
+            {"user_id": user_id, "sessions": len(profiles)},
+        )
+        return json_response({"saved": True, "profile": primary, "applied": applied})
 
     async def api_state(self):
         """概览信息。"""

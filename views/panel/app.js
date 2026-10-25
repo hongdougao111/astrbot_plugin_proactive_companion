@@ -256,24 +256,40 @@ async function loadProfiles() {
   const data = await bridge.apiGet("profiles");
   state.profiles = data.profiles || [];
   $("#profile-count").textContent = `共 ${data.total ?? state.profiles.length} 份画像`;
-  $("#profile-rows").innerHTML =
+  $("#profile-list").innerHTML =
     state.profiles
       .map((p) => {
         const idx = p.level_index ?? 0;
         const bar = "█".repeat(idx) + "░".repeat(4 - idx);
-        return `<tr data-key="${esc(p.session_key)}" data-user="${esc(p.user_id)}">
-        <td>${esc(p.nickname || "—")}</td>
-        <td class="name">${esc(p.user_id)}</td>
-        <td><span class="badge ${p.affection >= 30 ? "good" : ""}" title="${esc(p.level)}">${esc(
-      p.level
-    )} ${p.affection.toFixed(1)} <span class="muted">${bar}</span></span></td>
-        <td>${esc(p.msg_count)} / ${esc(p.bot_replies)}</td>
-        <td>${esc((p.tags || []).join("、") || "—")}</td>
-        <td class="name" title="${esc(p.note || "")}">${esc(p.note || "—")}</td>
-        <td><button class="btn tiny ghost" data-act="edit-profile">编辑</button></td>
-      </tr>`;
+        const tags = (p.tags || [])
+          .map((t) => `<span class="tag">${esc(t)}</span>`)
+          .join("");
+        const recent = (p.recent_messages || [])
+          .map((r) => esc(String(r.content || "").slice(0, 30)))
+          .filter(Boolean)
+          .join(" / ");
+        const sessions = p.session_count > 1 ? ` · ${p.session_count} 个会话` : "";
+        return `<div class="card block profile-card" data-key="${esc(
+      p.session_key
+    )}" data-user="${esc(p.user_id)}">
+          <div class="profile-head">
+            <div class="profile-name">${esc(p.nickname || "（未设置昵称）")}
+              <span class="muted">${esc(p.user_id)}</span></div>
+            <span class="badge ${p.affection >= 30 ? "good" : ""}" title="${esc(
+          p.level
+        )}">${esc(p.level)} ${p.affection.toFixed(1)} <span class="muted">${bar}</span></span>
+            <button class="btn tiny ghost" data-act="edit-profile">编辑</button>
+          </div>
+          <div class="profile-summary">${esc(p.summary || "")}</div>
+          ${tags ? `<div class="profile-tags">${tags}</div>` : ""}
+          <div class="muted profile-stat">互动 ${esc(p.msg_count)} 条 · 机器人回应 ${esc(
+      p.bot_replies
+    )} 次${sessions}</div>
+          ${p.note ? `<div class="profile-note">备注：${esc(p.note)}</div>` : ""}
+          ${recent ? `<div class="muted profile-foot">最近说过：${recent}</div>` : ""}
+        </div>`;
       })
-      .join("") || `<tr><td colspan="7" class="muted">还没有画像，聊几句就会出现</td></tr>`;
+      .join("") || `<div class="muted">还没有画像，聊几句就会出现</div>`;
 }
 
 function openProfileEditor(profile) {
@@ -283,6 +299,8 @@ function openProfileEditor(profile) {
   $("#pe-tags").value = (profile.tags || []).join(", ");
   $("#pe-affection").value = profile.affection ?? 0;
   $("#pe-note").value = profile.note || "";
+  const sessions = profile.session_count > 1 ? `，同时存在于 ${profile.session_count} 个会话` : "";
+  $("#profile-tip").textContent = `正在编辑 ${profile.nickname || profile.user_id}${sessions}；保存会同步到该用户的所有会话`;
   $("#profile-edit-card").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
@@ -291,7 +309,7 @@ async function saveProfile() {
   const btn = $("#btn-save-profile");
   btn.disabled = true;
   try {
-    await bridge.apiPost("profiles/update", {
+    const res = await bridge.apiPost("profiles/update", {
       session_key: editingProfile.session_key,
       user_id: editingProfile.user_id,
       nickname: $("#pe-nickname").value,
@@ -299,7 +317,12 @@ async function saveProfile() {
       affection: Number($("#pe-affection").value),
       note: $("#pe-note").value,
     });
-    toast("画像已保存");
+    const applied = res.applied || {};
+    const synced = applied.sessions > 1 ? `，同步到 ${applied.sessions} 个会话` : "";
+    toast(`画像已保存${synced}`);
+    $("#profile-tip").textContent = `已保存：${applied.nickname || "—"}${
+      applied.affection !== undefined ? ` · 好感 ${applied.affection}` : ""
+    }${synced}`;
     await loadProfiles();
   } catch (err) {
     toast(err.message || "保存失败", true);
@@ -460,13 +483,14 @@ function bindActions() {
     if (key) sessionAction(key, btn.dataset.act, btn);
   });
 
-  $("#profile-rows").addEventListener("click", (ev) => {
+  $("#profile-list").addEventListener("click", (ev) => {
     const btn = ev.target.closest("button[data-act='edit-profile']");
     if (!btn) return;
-    const tr = btn.closest("tr");
+    const card = btn.closest("[data-key]");
+    const key = card?.dataset.key;
+    const user = card?.dataset.user;
     const profile = state.profiles.find(
-      (p) =>
-        p.session_key === tr?.dataset.key && p.user_id === tr?.dataset.user
+      (p) => p.session_key === key && p.user_id === user
     );
     if (profile) openProfileEditor(profile);
   });

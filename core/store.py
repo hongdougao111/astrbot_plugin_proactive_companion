@@ -552,6 +552,149 @@ class Store:
 
         return await self._run(_do)
 
+    async def update_profile_fields_by_user(
+        self,
+        user_id: str,
+        session_key: str = "",
+        *,
+        note: str | None = None,
+        tags: list[str] | None = None,
+        affection: float | None = None,
+        nickname: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """按「人」修改画像：同步更新该用户在**所有会话**里的画像。
+
+        同一个人可能同时在群聊和私聊里跟机器人说话，画像按会话各存了一份，
+        只改其中一份的话，另一份看起来就像「没生效」。这里统一按 user_id
+        写入所有会话的画像；如果这个人还没有任何画像行，就新建一行。
+
+        返回更新后的全部画像行。
+        """
+        user_id = (user_id or "").strip()
+        if not user_id:
+            return []
+
+        def _do(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                "SELECT session_key FROM user_profiles WHERE user_id = ?"
+                " ORDER BY last_seen DESC",
+                (user_id,),
+            ).fetchall()
+            keys = [str(r["session_key"]) for r in rows]
+            if not keys:
+                keys = [session_key or ""]
+            updated: list[dict[str, Any]] = []
+            for key in keys:
+                profile = _update_one(
+                    conn,
+                    key,
+                    user_id,
+                    note=note,
+                    tags=tags,
+                    affection=affection,
+                    nickname=nickname,
+                )
+                if profile:
+                    updated.append(profile)
+            return updated
+
+        def _update_one(
+            conn: sqlite3.Connection,
+            key: str,
+            uid: str,
+            *,
+            note: str | None,
+            tags: list[str] | None,
+            affection: float | None,
+            nickname: str | None,
+        ) -> dict[str, Any] | None:
+            """在单个连接里执行更新，返回更新后的行。"""
+            sets: list[str] = []
+            values: list[Any] = []
+            if note is not None:
+                sets.append("note = ?")
+                values.append(note)
+            if tags is not None:
+                sets.append("tags = ?")
+                values.append(json.dumps(tags, ensure_ascii=False))
+            if affection is not None:
+                sets.append("affection = ?")
+                values.append(affection_mod.clamp(float(affection)))
+                sets.append("affection_at = ?")
+                values.append(time.time())
+            if nickname is not None:
+                sets.append("nickname = ?")
+                values.append(nickname)
+                sets.append("nickname_manual = 1")
+            if sets:
+                values.extend([key, uid])
+                conn.execute(
+                    f"UPDATE user_profiles SET {', '.join(sets)}"
+                    " WHERE session_key = ? AND user_id = ?",
+                    values,
+                )
+            row = conn.execute(
+                "SELECT * FROM user_profiles WHERE session_key = ? AND user_id = ?",
+                (key, uid),
+            ).fetchone()
+            if row is not None:
+                return dict(row)
+            # 这个会话还没有画像行 → 补一条（昵称/备注等直接落进去）
+            now = time.time()
+            conn.execute(
+                "INSERT INTO user_profiles (session_key, user_id, nickname, affection,"
+                " tags, note, msg_count, bot_replies, first_seen, last_seen,"
+                " affection_at, nickname_manual)"
+                " VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
+                (
+                    key,
+                    uid,
+                    nickname or "",
+                    affection_mod.clamp(float(affection or 0.0)),
+                    json.dumps(tags or [], ensure_ascii=False),
+                    note or "",
+                    now,
+                    now,
+                    now,
+                    1 if nickname else 0,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM user_profiles WHERE session_key = ? AND user_id = ?",
+                (key, uid),
+            ).fetchone()
+            return dict(row) if row else None
+
+        return await self._run(_do)
+
+    async def recent_messages_by_user(
+        self, user_id: str, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """取某个人最近说过的话（跨会话）。"""
+
+        def _do(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                "SELECT session_key, role, sender, content, ts FROM messages"
+                " WHERE sender_id = ? AND role = 'user'"
+                " ORDER BY id DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+            return [dict(r) for r in reversed(rows)]
+
+        return await self._run(_do)
+
+    async def user_profile_sessions(self, user_id: str) -> list[dict[str, Any]]:
+        """某个人在所有会话里的画像行（按最近活跃排序）。"""
+
+        def _do(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                "SELECT * FROM user_profiles WHERE user_id = ? ORDER BY last_seen DESC",
+                (user_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+        return await self._run(_do)
+
     async def update_profile_fields(
         self,
         session_key: str,
