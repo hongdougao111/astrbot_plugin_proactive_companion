@@ -2,6 +2,8 @@
 
 让 Bot 能在私聊与群聊中**主动发起消息**，并提供：
 
+- **主动消息**：定时巡检会话，在满足条件时主动开口。
+- **主动回复**：在机器人本来不会回复的消息上，按概率 + 白名单主动接话。
 - **上下文感知**：记录每个会话的近期对话，并结合 AstrBot 自身的会话历史生成话题。
 - **持久化数据**：会话、消息、情绪、事件日志全部落盘到 data/plugin_data/ 下。
 - **动态情绪**：valence/arousal 双维度情绪，随互动漂移并随时间衰减。
@@ -25,6 +27,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event.filter import CustomFilter
 from astrbot.api.message_components import Record
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import error_response, json_response, request
@@ -71,7 +74,37 @@ SAFE_DEFAULTS: dict[str, Any] = {
     "max_context_messages": 12,
     "keep_messages_per_session": 200,
     "keep_events": 1000,
+    "proactive_reply_enabled": False,
+    "proactive_reply_probability": 0.2,
+    "proactive_reply_whitelist": [],
+    "proactive_reply_cooldown_minutes": 10,
+    "proactive_reply_min_length": 2,
 }
+
+# 插件实例引用。过滤器在模块导入时即被实例化，拿不到插件实例，
+# 因此这里用模块级引用在运行时取回当前插件。
+_PLUGIN_REF: ProactiveCompanionPlugin | None = None
+
+
+class ProactiveReplyFilter(CustomFilter):
+    """决定一条消息是否触发「主动回复」。
+
+    只有当消息本身**不会**唤醒机器人时（即群里没被 @、私聊需要唤醒词等情况）
+    才可能触发，避免与正常回复重复。
+    """
+
+    def __init__(self, raise_error: bool = True, **kwargs: Any) -> None:
+        super().__init__(raise_error)
+
+    def filter(self, event: AstrMessageEvent, cfg: Any) -> bool:
+        plugin = _PLUGIN_REF
+        if plugin is None:
+            return False
+        try:
+            return plugin.should_proactive_reply(event, cfg)
+        except Exception as exc:  # pragma: no cover - 过滤器绝不能抛异常
+            logger.warning(f"[主动陪伴] 主动回复判定失败: {exc}")
+            return False
 
 
 def _now_str() -> str:
@@ -90,6 +123,10 @@ class ProactiveCompanionPlugin(Star):
         self._stopping = False
         self._last_tick_at: float = 0.0
         self._last_tick_error: str = ""
+        # 主动回复：记录每个会话上次触发的时间，用于冷却
+        self._proactive_reply_times: dict[str, float] = {}
+        global _PLUGIN_REF
+        _PLUGIN_REF = self
         self._register_web_apis()
 
     # ------------------------------------------------------------------
@@ -184,6 +221,139 @@ class ProactiveCompanionPlugin(Star):
     # ------------------------------------------------------------------
     # 消息监听（上下文感知 + 情绪输入）
     # ------------------------------------------------------------------
+    @filter.custom_filter(ProactiveReplyFilter)
+    async def proactive_reply(self, event: AstrMessageEvent) -> None:
+        """主动回复：命中概率与白名单后，让机器人用平时的人格自然接话。
+
+        这里刻意不产出结果，而是把 `is_at_or_wake_command` 置为 True，
+        让 AstrBot 走正常的 LLM 链路回复——这样主动接话的语气、人设、
+        上下文都和被 @ 时完全一致。
+        """
+        try:
+            event.is_at_or_wake_command = True
+            await self._on_proactive_reply(event)
+        except Exception as exc:  # pragma: no cover - 绝不影响正常对话
+            logger.warning(f"[主动陪伴] 主动回复处理失败: {exc}")
+
+    async def _on_proactive_reply(self, event: AstrMessageEvent) -> None:
+        umo = event.unified_msg_origin
+        self._proactive_reply_times[umo] = time.time()
+        chat_type = self._chat_type(event)
+        await self.store.ensure_session(
+            umo,
+            umo,
+            event.get_platform_name() or "",
+            chat_type,
+            self._session_title(event),
+        )
+        await self.store.add_message(
+            umo,
+            "user",
+            (event.message_str or "").strip(),
+            event.get_sender_name() or "",
+        )
+        session = await self.store.get_session(umo)
+        count = int((session or {}).get("proactive_replies") or 0) + 1
+        await self.store.update_session(umo, proactive_replies=count)
+        await self.store.add_event(
+            "proactive_reply",
+            umo,
+            {
+                "sender": event.get_sender_id() or "",
+                "text": (event.message_str or "").strip()[:200],
+            },
+        )
+
+    def should_proactive_reply(self, event: AstrMessageEvent, cfg: Any) -> bool:
+        """判断这条消息是否应该触发主动回复（同步、无 IO）。"""
+        if not self._cfg_bool("proactive_reply_enabled", False):
+            return False
+        # 总开关关闭时不启用
+        if not self._cfg_bool("enabled", True):
+            return False
+        # 机器人本来就会回复（被 @ / 唤醒词 / 私聊）→ 不重复触发
+        if getattr(event, "is_wake", False):
+            return False
+        # 自己发的消息不回复
+        try:
+            if str(event.get_sender_id() or "") == str(event.get_self_id() or ""):
+                return False
+        except Exception:
+            pass
+        content = (event.message_str or "").strip()
+        min_length = max(0, self._cfg_int("proactive_reply_min_length", 2))
+        if len(content) < min_length:
+            return False
+        # 指令消息不主动接话（否则会和指令回复撞车）
+        if self._looks_like_command(content, cfg):
+            return False
+        # 免打扰时段
+        if dnd.in_quiet_hours(_dt.datetime.now(), self._cfg_list("quiet_hours", [])):
+            return False
+        # 白名单
+        if not self._in_reply_whitelist(event):
+            return False
+        # 冷却：同一会话两次主动回复的最小间隔
+        umo = event.unified_msg_origin
+        cooldown = max(0, self._cfg_int("proactive_reply_cooldown_minutes", 10))
+        last = self._proactive_reply_times.get(umo, 0.0)
+        if cooldown > 0 and (time.time() - last) < cooldown * 60:
+            return False
+        # 概率（放在最后，避免无谓消耗随机数）
+        probability = self._cfg_float("proactive_reply_probability", 0.2)
+        probability = max(0.0, min(1.0, probability))
+        if probability <= 0.0:
+            return False
+        if probability >= 1.0:
+            return True
+        return random.random() < probability
+
+    def _looks_like_command(self, content: str, cfg: Any) -> bool:
+        """判断消息是否是指令（指令消息不参与主动回复）。"""
+        if content.startswith("/"):
+            return True
+        prefixes: list[str] = []
+        try:
+            if cfg is not None:
+                raw = cfg.get("wake_prefix") or []
+                if isinstance(raw, str):
+                    raw = [raw]
+                prefixes = [str(p) for p in raw if str(p)]
+        except Exception:
+            prefixes = []
+        return any(prefix and content.startswith(prefix) for prefix in prefixes)
+
+    def _in_reply_whitelist(self, event: AstrMessageEvent) -> bool:
+        """白名单判定：命中发送者 ID / 会话 ID / 群号 / umo 之一即可。"""
+        whitelist = [
+            str(item).strip()
+            for item in self._cfg_list("proactive_reply_whitelist", [])
+            if str(item).strip()
+        ]
+        if not whitelist:
+            # 白名单为空 = 不允许任何人主动回复
+            return False
+        if "*" in whitelist:
+            return True
+        candidates: set[str] = set()
+        try:
+            candidates.add(str(event.get_sender_id() or ""))
+        except Exception:
+            pass
+        try:
+            candidates.add(str(event.get_group_id() or ""))
+        except Exception:
+            pass
+        try:
+            candidates.add(str(event.get_session_id() or ""))
+        except Exception:
+            pass
+        try:
+            candidates.add(str(event.unified_msg_origin or ""))
+        except Exception:
+            pass
+        return any(item in candidates for item in whitelist)
+
     @filter.on_decorating_result()
     async def capture_turn(self, event: AstrMessageEvent) -> None:
         """在机器人发送回复前记录这一轮对话，用于上下文感知与情绪计算。
@@ -779,11 +949,13 @@ class ProactiveCompanionPlugin(Star):
         today = _dt.date.today().isoformat()
         active = 0
         sent_today = 0
+        reply_total = 0
         for s in sessions:
             if int(s.get("enabled") or 0):
                 active += 1
             if str(s.get("daily_date") or "") == today:
                 sent_today += int(s.get("daily_count") or 0)
+            reply_total += int(s.get("proactive_replies") or 0)
         quiet = self._cfg_list("quiet_hours", [])
         moods = [self._session_mood(s) for s in sessions] or [emotion.EmotionState()]
         avg_valence = sum(m.valence for m in moods) / len(moods)
@@ -812,6 +984,20 @@ class ProactiveCompanionPlugin(Star):
                 "last_tick_at": self._last_tick_at,
                 "last_tick_error": self._last_tick_error,
                 "tts_enabled": self._cfg_bool("tts_enabled", False),
+                "proactive_reply_enabled": self._cfg_bool(
+                    "proactive_reply_enabled", False
+                ),
+                "proactive_reply_probability": round(
+                    max(
+                        0.0,
+                        min(1.0, self._cfg_float("proactive_reply_probability", 0.2)),
+                    ),
+                    3,
+                ),
+                "proactive_reply_whitelist": self._cfg_list(
+                    "proactive_reply_whitelist", []
+                ),
+                "proactive_replies_total": reply_total,
                 "data_dir": str(self.data_dir),
                 "server_time": now,
             }
@@ -831,6 +1017,7 @@ class ProactiveCompanionPlugin(Star):
                 "chat_type": s.get("chat_type") or "",
                 "enabled": bool(int(s.get("enabled") or 0)),
                 "messages_sent": int(s.get("messages_sent") or 0),
+                "proactive_replies": int(s.get("proactive_replies") or 0),
                 "daily_count": int(s.get("daily_count") or 0),
                 "last_msg_at": float(s.get("last_msg_at") or 0),
                 "last_proactive_at": float(s.get("last_proactive_at") or 0),
