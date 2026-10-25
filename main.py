@@ -39,7 +39,7 @@ except Exception:  # pragma: no cover - 极端情况下退回不注入
 
 try:
     # 正常情况：AstrBot 以 `data.plugins.<插件名>.main` 的形式加载插件，相对导入可用。
-    from .core import dnd, emotion, generator
+    from .core import atmosphere, dnd, emotion, generator
     from .core.store import Store
 except ImportError:  # pragma: no cover - 兜底：插件被以独立脚本方式加载时
     import importlib
@@ -49,6 +49,7 @@ except ImportError:  # pragma: no cover - 兜底：插件被以独立脚本方�
     _plugin_dir = str(_Path(__file__).resolve().parent)
     if _plugin_dir not in _sys.path:
         _sys.path.insert(0, _plugin_dir)
+    atmosphere = importlib.import_module("core.atmosphere")
     dnd = importlib.import_module("core.dnd")
     emotion = importlib.import_module("core.emotion")
     generator = importlib.import_module("core.generator")
@@ -87,6 +88,13 @@ SAFE_DEFAULTS: dict[str, Any] = {
     "capture_context_enabled": True,
     "proactive_reply_context_messages": 12,
     "capture_context_max_sessions": 200,
+    "atmosphere_enabled": True,
+    "atmosphere_window_minutes": 30,
+    "atmosphere_refresh_minutes": 3,
+    "atmosphere_cold_rate": 0.12,
+    "atmosphere_hot_rate": 0.8,
+    "atmosphere_conflict_ratio": 0.15,
+    "atmosphere_boost": 1.5,
 }
 
 # 插件实例引用。过滤器在模块导入时即被实例化，拿不到插件实例，
@@ -148,6 +156,9 @@ class ProactiveCompanionPlugin(Star):
         self._last_reply_decision: str = "尚未判定"
         # 各判定原因的跳过次数（面板上展示）
         self._reply_skip_reasons: dict[str, int] = {}
+        # 气氛缓存：session_key -> Atmosphere（供同步过滤器快速读取）
+        self._atmosphere_cache: dict[str, Any] = {}
+        self._atmosphere_refreshed_at: dict[str, float] = {}
         global _PLUGIN_REF
         _PLUGIN_REF = self
         self._register_web_apis()
@@ -234,6 +245,7 @@ class ProactiveCompanionPlugin(Star):
             interval = max(15, self._cfg_int("check_interval_seconds", 60))
             try:
                 await asyncio.sleep(interval)
+                await self._refresh_atmospheres()
                 await self.tick()
             except asyncio.CancelledError:
                 raise
@@ -274,16 +286,19 @@ class ProactiveCompanionPlugin(Star):
         try:
             limit = max(1, self._cfg_int("proactive_reply_context_messages", 12))
             messages = await self.store.recent_messages(umo, limit)
-            if not messages:
+            hint = self._atmosphere_hint(umo)
+            if not messages and not hint:
                 return
-            text = self._format_context_block(messages)
+            text = self._format_context_block(messages, hint)
             if not text:
                 return
             req.extra_user_content_parts.append(TextPart(text=text).mark_as_temp())
         except Exception as exc:  # pragma: no cover
             logger.warning(f"[主动陪伴] 注入上下文失败: {exc}")
 
-    def _format_context_block(self, messages: list[dict[str, Any]]) -> str:
+    def _format_context_block(
+        self, messages: list[dict[str, Any]], atmosphere_hint: str = ""
+    ) -> str:
         """把记录的消息格式化成给 LLM 的上下文块。"""
         lines: list[str] = []
         for msg in messages:
@@ -301,17 +316,20 @@ class ProactiveCompanionPlugin(Star):
             else:
                 lines.append(f"{sender or '对方'}: {content}")
         if not lines:
-            return ""
+            return atmosphere_hint
         body = "\n".join(lines)
+        hint_block = f"{atmosphere_hint}\n" if atmosphere_hint else ""
         return (
             "<chat_context>\n"
             "以下是当前会话最近的对话记录，请据此理解上下文，"
             "不要逐条复述，也不要提及这些记录本身：\n"
             f"{body}\n"
             "</chat_context>\n"
+            f"{hint_block}"
             "<reply_hint>\n"
             "你现在是主动参与这段对话（对方并没有点名你），"
-            "请像真人一样自然地接话，回复要简短，不要显得突兀或莫名其妙。\n"
+            "请像真人一样自然地接话，回复要简短，不要显得突兀或莫名其妙。"
+            "也要顾及当前群里的气氛，别抢话、别在气氛紧张时插嘴。\n"
             "</reply_hint>"
         )
 
@@ -371,6 +389,67 @@ class ProactiveCompanionPlugin(Star):
             event.set_extra(_CAPTURED_FLAG, True)
         except Exception:  # pragma: no cover
             pass
+        await self._maybe_refresh_atmosphere(umo)
+
+    # ------------------------------------------------------------------
+    # 气氛感知
+    # ------------------------------------------------------------------
+    async def _maybe_refresh_atmosphere(self, session_key: str) -> None:
+        """按节流刷新某个会话的气氛。"""
+        if not self._cfg_bool("atmosphere_enabled", True):
+            return
+        now = time.time()
+        refresh_minutes = max(0.5, self._cfg_float("atmosphere_refresh_minutes", 3))
+        last = self._atmosphere_refreshed_at.get(session_key, 0.0)
+        if now - last < refresh_minutes * 60:
+            return
+        self._atmosphere_refreshed_at[session_key] = now
+        try:
+            window = max(1, self._cfg_int("atmosphere_window_minutes", 30))
+            messages = await self.store.recent_messages(session_key, window * 2)
+            state = atmosphere.analyze(
+                messages,
+                now=now,
+                window_minutes=window,
+                cold_rate=self._cfg_float("atmosphere_cold_rate", 0.12),
+                hot_rate=self._cfg_float("atmosphere_hot_rate", 0.8),
+                conflict_ratio=self._cfg_float("atmosphere_conflict_ratio", 0.15),
+            )
+            self._atmosphere_cache[session_key] = state
+            await self.store.update_atmosphere(session_key, state.to_dict())
+        except Exception as exc:  # pragma: no cover
+            logger.debug(f"[主动陪伴] 刷新气氛失败: {exc}")
+
+    async def _refresh_atmospheres(self) -> None:
+        """为所有被跟踪的会话刷新气氛。"""
+        if not self._cfg_bool("atmosphere_enabled", True):
+            return
+        for session_key in list(self._tracked_sessions):
+            try:
+                await self._maybe_refresh_atmosphere(session_key)
+            except Exception:  # pragma: no cover
+                continue
+
+    def _atmosphere_of(self, session_key: str) -> Any:
+        """同步读取缓存的气氛（没有缓存时返回 None）。"""
+        if not self._cfg_bool("atmosphere_enabled", True):
+            return None
+        return self._atmosphere_cache.get(session_key)
+
+    def _atmosphere_levels(self) -> dict[str, int]:
+        """统计各气氛等级的会话数量。"""
+        levels: dict[str, int] = {}
+        for state in self._atmosphere_cache.values():
+            level = getattr(state, "level", "未知")
+            levels[level] = levels.get(level, 0) + 1
+        return levels
+
+    def _atmosphere_hint(self, session_key: str) -> str:
+        """给提示词用的一句话气氛提示。"""
+        state = self._atmosphere_of(session_key)
+        if state is None:
+            return ""
+        return f"当前气氛：{state.level}。{state.advice}"
 
     def _should_track(self, event: AstrMessageEvent) -> bool:
         """是否需要记录这个会话的消息。"""
@@ -486,8 +565,17 @@ class ProactiveCompanionPlugin(Star):
         probability = max(0.0, min(1.0, probability))
         if probability <= 0.0:
             return False, "回复概率为 0"
+        # 读空气：气氛影响触发概率
+        state = self._atmosphere_of(umo)
+        if state is not None:
+            factor = atmosphere.probability_factor(
+                state, boost=self._cfg_float("atmosphere_boost", 1.5)
+            )
+            if factor <= 0.0:
+                return False, f"气氛{state.level}，不插嘴"
+            probability = min(1.0, probability * factor)
         if probability < 1.0 and random.random() >= probability:
-            return False, f"未命中概率（{probability}）"
+            return False, f"未命中概率（{probability:.2f}）"
         return True, "命中"
 
     def _looks_like_command(self, content: str, cfg: Any) -> bool:
@@ -718,6 +806,14 @@ class ProactiveCompanionPlugin(Star):
 
         min_idle = self._idle_threshold_minutes()
         idle_minutes = (now - anchor) / 60.0 if anchor else 0.0
+        # 读空气：群正热闹或气氛紧张时不要硬插话
+        state = self._atmosphere_of(session_key)
+        if state is not None:
+            if not atmosphere.allow_proactive_message(state):
+                return False
+            if state.level == atmosphere.LEVEL_COLD:
+                # 冷场时允许更早一点暖场
+                min_idle = min_idle * 0.5
         if idle_minutes < min_idle:
             return False
 
@@ -828,6 +924,9 @@ class ProactiveCompanionPlugin(Star):
             is_group=chat_type == "group",
             group_title=str(session.get("title") or ""),
         )
+        hint = self._atmosphere_hint(umo)
+        if hint:
+            prompt = f"{hint}\n\n{prompt}"
         if manual:
             prompt = "用户刚刚主动要求你发一条消息，请自然地回应。\n\n" + prompt
 
@@ -1051,6 +1150,16 @@ class ProactiveCompanionPlugin(Star):
             )
         else:
             lines.append("本会话：还没有任何记录（说明消息没被采集到）")
+        state = self._atmosphere_of(umo)
+        if state is not None:
+            lines.append(
+                f"气氛：{state.level}（活跃度 {state.score:.2f}，"
+                f"情绪 {state.positivity:+.2f}，冲突 {state.conflict:.2f}，"
+                f"{state.message_count} 条 / {state.participants} 人）"
+            )
+            lines.append(f"建议：{state.advice}")
+        else:
+            lines.append("气氛：暂无数据（读空气已关闭或还没算过）")
         yield event.plain_result("\n".join(lines))
 
     @companion.command("清空", alias={"clear", "reset"})
@@ -1225,6 +1334,8 @@ class ProactiveCompanionPlugin(Star):
                     "capture_context_enabled", True
                 ),
                 "captured_sessions": len(self._tracked_sessions),
+                "atmosphere_enabled": self._cfg_bool("atmosphere_enabled", True),
+                "atmosphere_levels": self._atmosphere_levels(),
                 "data_dir": str(self.data_dir),
                 "server_time": now,
             }
@@ -1235,8 +1346,12 @@ class ProactiveCompanionPlugin(Star):
         keyword = (request.query.get("q") or "").strip().lower()
         sessions = await self.store.list_sessions()
         result = []
+        levels: dict[str, int] = {}
         for s in sessions:
             mood = self._session_mood(s)
+            state = self._atmosphere_of(str(s.get("session_key") or ""))
+            level = state.level if state is not None else "未知"
+            levels[level] = levels.get(level, 0) + 1
             item = {
                 "session_key": s.get("session_key"),
                 "title": s.get("title") or s.get("session_key"),
@@ -1251,6 +1366,8 @@ class ProactiveCompanionPlugin(Star):
                 "valence": round(mood.valence, 3),
                 "arousal": round(mood.arousal, 3),
                 "mood_label": emotion.label_for(mood),
+                "atmosphere": state.to_dict() if state is not None else {},
+                "atmosphere_level": level,
                 "mentioned": self._mentioned_recently(s, time.time()),
             }
             if keyword:
@@ -1258,7 +1375,9 @@ class ProactiveCompanionPlugin(Star):
                 if keyword not in haystack:
                     continue
             result.append(item)
-        return json_response({"sessions": result, "total": len(result)})
+        return json_response(
+            {"sessions": result, "total": len(result), "atmosphere_levels": levels}
+        )
 
     async def api_toggle_session(self):
         """开启/关闭某个会话的主动消息。"""

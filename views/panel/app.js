@@ -43,6 +43,13 @@ const CONFIG_FIELDS = [
   { key: "capture_context_enabled", label: "采集对话上下文", type: "bool" },
   { key: "proactive_reply_context_messages", label: "注入上下文条数", type: "int", min: 1 },
   { key: "capture_context_max_sessions", label: "最多采集会话数", type: "int", min: 1 },
+  { key: "atmosphere_enabled", label: "启用读空气", type: "bool" },
+  { key: "atmosphere_window_minutes", label: "气氛判断窗口(分钟)", type: "int", min: 1 },
+  { key: "atmosphere_refresh_minutes", label: "气氛刷新间隔(分钟)", type: "int", min: 1 },
+  { key: "atmosphere_cold_rate", label: "冷清阈值(条/分钟)", type: "float", min: 0 },
+  { key: "atmosphere_hot_rate", label: "热闹阈值(条/分钟)", type: "float", min: 0 },
+  { key: "atmosphere_conflict_ratio", label: "紧张阈值(冲突占比)", type: "float", min: 0 },
+  { key: "atmosphere_boost", label: "冷场概率放大倍数", type: "float", min: 0 },
   { key: "system_prompt", label: "人设提示词", type: "textarea" },
 ];
 
@@ -117,6 +124,14 @@ async function loadState() {
         data.captured_sessions ?? 0
       } 个会话）`,
     ],
+    [
+      "读空气",
+      `${data.atmosphere_enabled ? "开" : "关"}（${
+        Object.entries(data.atmosphere_levels || {})
+          .map(([k, v]) => `${k}×${v}`)
+          .join("、") || "暂无数据"
+      }）`,
+    ],
     ["TTS", data.tts_enabled ? "已启用" : "未启用"],
     ["上次检查", fmtTime(data.last_tick_at)],
     ["最近错误", data.last_tick_error || "无"],
@@ -148,10 +163,25 @@ async function loadSessions() {
     .map((s) => {
       const chat = s.chat_type === "group" ? "群聊" : "私聊";
       const moodClass = s.valence >= 0.15 ? "good" : s.valence <= -0.15 ? "bad" : "";
+      const air = s.atmosphere || {};
+      const airClass =
+        s.atmosphere_level === "热闹"
+          ? "good"
+          : s.atmosphere_level === "紧张"
+            ? "bad"
+            : "";
+      const airText = s.atmosphere_level
+        ? `${s.atmosphere_level}${
+            air.message_count
+              ? ` · ${air.message_count}条/${air.participants}人`
+              : ""
+          }`
+        : "—";
       return `<tr data-key="${esc(s.session_key)}">
         <td class="name" title="${esc(s.title || s.session_key)}">${esc(s.title || s.session_key)}</td>
         <td>${esc(chat)}${s.mentioned ? " <span class=\"badge\">@过我</span>" : ""}</td>
         <td><span class="badge ${moodClass}">${esc(s.mood_label)}</span></td>
+        <td><span class="badge ${airClass}" title="${esc(air.advice || "")}">${esc(airText)}</span></td>
         <td>${esc(s.messages_sent)}</td>
         <td>${esc(s.daily_count)}</td>
         <td><span class="badge ${s.enabled ? "good" : "bad"}">${s.enabled ? "开启" : "关闭"}</span></td>
@@ -167,7 +197,8 @@ async function loadSessions() {
       </tr>`;
     })
     .join("");
-  $("#session-rows").innerHTML = rows || `<tr><td colspan="7" class="muted">暂无会话记录</td></tr>`;
+  $("#session-rows").innerHTML =
+    rows || `<tr><td colspan="8" class="muted">暂无会话记录</td></tr>`;
 }
 
 async function sessionAction(key, act, btn) {
