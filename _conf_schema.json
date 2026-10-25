@@ -135,7 +135,7 @@
   "proactive_reply_enabled": {
     "description": "启用主动回复",
     "type": "bool",
-    "default": false,
+    "default": true,
     "hint": "开启后，机器人会在本来不会回复的消息上按概率主动接话（群里没被 @、私聊需要唤醒词等场景）。"
   },
   "proactive_reply_probability": {
@@ -151,7 +151,7 @@
     "items": {
       "type": "string"
     },
-    "hint": "填用户 ID、群号、会话 ID 或 unified_msg_origin，命中任意一项即可。留空表示不允许任何人主动回复；填 * 表示不限制。"
+    "hint": "留空 = 不限制（任何人都可能触发主动回复）。填写用户 ID、群号、会话 ID 或 unified_msg_origin 后，只有命中者才会触发；填 * 也是不限制。"
   },
   "proactive_reply_cooldown_minutes": {
     "description": "主动回复冷却（分钟）",
@@ -164,5 +164,23 @@
     "type": "int",
     "default": 2,
     "hint": "太短的消息（如「嗯」「？」）不触发主动回复。"
+  },
+  "capture_context_enabled": {
+    "description": "采集对话上下文",
+    "type": "bool",
+    "default": true,
+    "hint": "在后台记录收到的消息，让主动回复能结合上下文。只记录被跟踪的会话，数据存在本地。"
+  },
+  "proactive_reply_context_messages": {
+    "description": "注入给模型的上下文条数",
+    "type": "int",
+    "default": 12,
+    "hint": "主动回复时，把最近多少条对话记录作为上下文交给模型。"
+  },
+  "capture_context_max_sessions": {
+    "description": "最多采集多少个会话",
+    "type": "int",
+    "default": 200,
+    "hint": "限制被动采集的会话数量，避免在很多群里无限增长。"
   }
 }

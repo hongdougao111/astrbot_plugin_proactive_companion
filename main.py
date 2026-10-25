@@ -33,6 +33,11 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import error_response, json_response, request
 
 try:
+    from astrbot.core.agent.message import TextPart
+except Exception:  # pragma: no cover - 极端情况下退回不注入
+    TextPart = None  # type: ignore[assignment]
+
+try:
     # 正常情况：AstrBot 以 `data.plugins.<插件名>.main` 的形式加载插件，相对导入可用。
     from .core import dnd, emotion, generator
     from .core.store import Store
@@ -74,20 +79,31 @@ SAFE_DEFAULTS: dict[str, Any] = {
     "max_context_messages": 12,
     "keep_messages_per_session": 200,
     "keep_events": 1000,
-    "proactive_reply_enabled": False,
+    "proactive_reply_enabled": True,
     "proactive_reply_probability": 0.2,
     "proactive_reply_whitelist": [],
     "proactive_reply_cooldown_minutes": 10,
     "proactive_reply_min_length": 2,
+    "capture_context_enabled": True,
+    "proactive_reply_context_messages": 12,
+    "capture_context_max_sessions": 200,
 }
 
 # 插件实例引用。过滤器在模块导入时即被实例化，拿不到插件实例，
 # 因此这里用模块级引用在运行时取回当前插件。
 _PLUGIN_REF: ProactiveCompanionPlugin | None = None
 
+# 事件上的临时标记：这条消息已经被插件记录过，避免重复入库
+_CAPTURED_FLAG = "_pac_message_captured"
+# 主动回复事件上的标记：本次 LLM 请求需要注入插件记录的上下文
+_PROACTIVE_SESSION_KEY = "_pac_proactive_session"
+
 
 class ProactiveReplyFilter(CustomFilter):
     """决定一条消息是否触发「主动回复」。
+
+    过滤器对每一条消息都会被求值，因此这里顺带做**被动上下文采集**：
+    把真实对话记录下来，主动回复时才有上下文可用。
 
     只有当消息本身**不会**唤醒机器人时（即群里没被 @、私聊需要唤醒词等情况）
     才可能触发，避免与正常回复重复。
@@ -101,6 +117,7 @@ class ProactiveReplyFilter(CustomFilter):
         if plugin is None:
             return False
         try:
+            plugin.capture_message_background(event)
             return plugin.should_proactive_reply(event, cfg)
         except Exception as exc:  # pragma: no cover - 过滤器绝不能抛异常
             logger.warning(f"[主动陪伴] 主动回复判定失败: {exc}")
@@ -125,6 +142,12 @@ class ProactiveCompanionPlugin(Star):
         self._last_tick_error: str = ""
         # 主动回复：记录每个会话上次触发的时间，用于冷却
         self._proactive_reply_times: dict[str, float] = {}
+        # 被动采集：已经被记录过对话的会话
+        self._tracked_sessions: set[str] = set()
+        # 最近一次主动回复判定结果，便于在面板上排查为什么没触发
+        self._last_reply_decision: str = "尚未判定"
+        # 各判定原因的跳过次数（面板上展示）
+        self._reply_skip_reasons: dict[str, int] = {}
         global _PLUGIN_REF
         _PLUGIN_REF = self
         self._register_web_apis()
@@ -227,13 +250,162 @@ class ProactiveCompanionPlugin(Star):
 
         这里刻意不产出结果，而是把 `is_at_or_wake_command` 置为 True，
         让 AstrBot 走正常的 LLM 链路回复——这样主动接话的语气、人设、
-        上下文都和被 @ 时完全一致。
+        上下文都和被 @ 时完全一致。同时打上标记，
+        由 `on_llm_request` 钩子把插件记录的对话上下文注入这次请求。
         """
         try:
             event.is_at_or_wake_command = True
+            event.set_extra(_PROACTIVE_SESSION_KEY, event.unified_msg_origin)
             await self._on_proactive_reply(event)
         except Exception as exc:  # pragma: no cover - 绝不影响正常对话
             logger.warning(f"[主动陪伴] 主动回复处理失败: {exc}")
+
+    @filter.on_llm_request()
+    async def inject_proactive_context(self, event: AstrMessageEvent, req: Any) -> None:
+        """把插件记录的对话上下文注入主动回复的 LLM 请求。
+
+        AstrBot 自身的会话历史只包含「机器人参与过」的对话，群里其他人聊天
+        并不在里面，所以主动回复必须由插件把上下文补上。
+        注入的内容标记为临时内容，不会写入会话历史。
+        """
+        umo = event.get_extra(_PROACTIVE_SESSION_KEY)
+        if not umo or TextPart is None:
+            return
+        try:
+            limit = max(1, self._cfg_int("proactive_reply_context_messages", 12))
+            messages = await self.store.recent_messages(umo, limit)
+            if not messages:
+                return
+            text = self._format_context_block(messages)
+            if not text:
+                return
+            req.extra_user_content_parts.append(TextPart(text=text).mark_as_temp())
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"[主动陪伴] 注入上下文失败: {exc}")
+
+    def _format_context_block(self, messages: list[dict[str, Any]]) -> str:
+        """把记录的消息格式化成给 LLM 的上下文块。"""
+        lines: list[str] = []
+        for msg in messages:
+            content = str(msg.get("content") or "").strip()
+            if not content:
+                continue
+            role = str(msg.get("role") or "")
+            sender = str(msg.get("sender") or "").strip()
+            if role == "user":
+                lines.append(f"{sender or '对方'}: {content}")
+            elif role == "bot":
+                lines.append(f"我: {content}")
+            elif role == "proactive":
+                lines.append(f"我(之前主动搭话): {content}")
+            else:
+                lines.append(f"{sender or '对方'}: {content}")
+        if not lines:
+            return ""
+        body = "\n".join(lines)
+        return (
+            "<chat_context>\n"
+            "以下是当前会话最近的对话记录，请据此理解上下文，"
+            "不要逐条复述，也不要提及这些记录本身：\n"
+            f"{body}\n"
+            "</chat_context>\n"
+            "<reply_hint>\n"
+            "你现在是主动参与这段对话（对方并没有点名你），"
+            "请像真人一样自然地接话，回复要简短，不要显得突兀或莫名其妙。\n"
+            "</reply_hint>"
+        )
+
+    # ------------------------------------------------------------------
+    # 被动上下文采集
+    # ------------------------------------------------------------------
+    def capture_message_background(self, event: AstrMessageEvent) -> None:
+        """被动记录收到的消息，供上下文感知使用（不阻塞消息处理）。"""
+        if not self._cfg_bool("capture_context_enabled", True):
+            return
+        if not self._cfg_bool("enabled", True):
+            return
+        content = (event.message_str or "").strip()
+        if not content:
+            return
+        try:
+            if str(event.get_sender_id() or "") == str(event.get_self_id() or ""):
+                return
+        except Exception:
+            pass
+        if not self._should_track(event):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - 非异步环境
+            return
+        task = loop.create_task(self._capture_message(event, content))
+        task.add_done_callback(self._on_capture_done)
+
+    def _on_capture_done(self, task: Any) -> None:
+        try:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(f"[主动陪伴] 采集消息失败: {exc}")
+        except Exception:  # pragma: no cover
+            pass
+
+    async def _capture_message(self, event: AstrMessageEvent, content: str) -> None:
+        umo = event.unified_msg_origin
+        sender = ""
+        try:
+            sender = event.get_sender_name() or event.get_sender_id() or ""
+        except Exception:
+            sender = ""
+        await self.store.ensure_session(
+            umo,
+            umo,
+            event.get_platform_name() or "",
+            self._chat_type(event),
+            self._session_title(event),
+        )
+        self._tracked_sessions.add(umo)
+        await self.store.add_message(umo, "user", content, sender)
+        try:
+            event.set_extra(_CAPTURED_FLAG, True)
+        except Exception:  # pragma: no cover
+            pass
+
+    def _should_track(self, event: AstrMessageEvent) -> bool:
+        """是否需要记录这个会话的消息。"""
+        try:
+            umo = event.unified_msg_origin
+        except Exception:
+            return False
+        if umo in self._tracked_sessions:
+            return True
+        whitelist = [
+            str(item).strip()
+            for item in self._cfg_list("proactive_reply_whitelist", [])
+            if str(item).strip()
+        ]
+        if not whitelist or "*" in whitelist:
+            # 允许所有人主动回复 → 记录所有会话的上下文
+            return self._can_track_more()
+        candidates: set[str] = set()
+        for getter in ("get_sender_id", "get_group_id", "get_session_id"):
+            try:
+                candidates.add(str(getattr(event, getter)() or ""))
+            except Exception:
+                pass
+        try:
+            candidates.add(str(event.unified_msg_origin or ""))
+        except Exception:
+            pass
+        if any(item in candidates for item in whitelist):
+            return self._can_track_more()
+        return False
+
+    def _can_track_more(self) -> bool:
+        """限制被动采集的会话数量，避免在超大群里无限膨胀。"""
+        limit = max(1, self._cfg_int("capture_context_max_sessions", 200))
+        return len(self._tracked_sessions) < limit
 
     async def _on_proactive_reply(self, event: AstrMessageEvent) -> None:
         umo = event.unified_msg_origin
@@ -246,12 +418,13 @@ class ProactiveCompanionPlugin(Star):
             chat_type,
             self._session_title(event),
         )
-        await self.store.add_message(
-            umo,
-            "user",
-            (event.message_str or "").strip(),
-            event.get_sender_name() or "",
-        )
+        if not event.get_extra(_CAPTURED_FLAG, False):
+            await self.store.add_message(
+                umo,
+                "user",
+                (event.message_str or "").strip(),
+                event.get_sender_name() or "",
+            )
         session = await self.store.get_session(umo)
         count = int((session or {}).get("proactive_replies") or 0) + 1
         await self.store.update_session(umo, proactive_replies=count)
@@ -266,47 +439,56 @@ class ProactiveCompanionPlugin(Star):
 
     def should_proactive_reply(self, event: AstrMessageEvent, cfg: Any) -> bool:
         """判断这条消息是否应该触发主动回复（同步、无 IO）。"""
-        if not self._cfg_bool("proactive_reply_enabled", False):
-            return False
-        # 总开关关闭时不启用
+        allowed, reason = self._evaluate_proactive_reply(event, cfg)
+        if allowed:
+            self._last_reply_decision = reason
+            self._reply_skip_reasons.pop(reason, None)
+        else:
+            self._last_reply_decision = reason
+            self._reply_skip_reasons[reason] = (
+                self._reply_skip_reasons.get(reason, 0) + 1
+            )
+        return allowed
+
+    def _evaluate_proactive_reply(
+        self, event: AstrMessageEvent, cfg: Any
+    ) -> tuple[bool, str]:
+        """返回 (是否主动回复, 未触发的原因)，便于排查。"""
+        if not self._cfg_bool("proactive_reply_enabled", True):
+            return False, "主动回复开关已关闭"
         if not self._cfg_bool("enabled", True):
-            return False
-        # 机器人本来就会回复（被 @ / 唤醒词 / 私聊）→ 不重复触发
-        if getattr(event, "is_wake", False):
-            return False
-        # 自己发的消息不回复
+            return False, "插件总开关已关闭"
+        # 机器人本来就会回复（被 @ / 唤醒词 / 私聊）→ 不重复触发。
+        # 注意不能用 is_wake：任何插件的监听器通过过滤器都会把它置 True。
+        if getattr(event, "is_at_or_wake_command", False):
+            return False, "该消息本来就会唤醒机器人"
         try:
             if str(event.get_sender_id() or "") == str(event.get_self_id() or ""):
-                return False
+                return False, "机器人自己的消息"
         except Exception:
             pass
         content = (event.message_str or "").strip()
         min_length = max(0, self._cfg_int("proactive_reply_min_length", 2))
         if len(content) < min_length:
-            return False
-        # 指令消息不主动接话（否则会和指令回复撞车）
+            return False, f"消息过短（<{min_length}）"
         if self._looks_like_command(content, cfg):
-            return False
-        # 免打扰时段
+            return False, "指令消息"
         if dnd.in_quiet_hours(_dt.datetime.now(), self._cfg_list("quiet_hours", [])):
-            return False
-        # 白名单
+            return False, "处于免打扰时段"
         if not self._in_reply_whitelist(event):
-            return False
-        # 冷却：同一会话两次主动回复的最小间隔
+            return False, "不在主动回复白名单内"
         umo = event.unified_msg_origin
         cooldown = max(0, self._cfg_int("proactive_reply_cooldown_minutes", 10))
         last = self._proactive_reply_times.get(umo, 0.0)
         if cooldown > 0 and (time.time() - last) < cooldown * 60:
-            return False
-        # 概率（放在最后，避免无谓消耗随机数）
+            return False, f"冷却中（{cooldown} 分钟）"
         probability = self._cfg_float("proactive_reply_probability", 0.2)
         probability = max(0.0, min(1.0, probability))
         if probability <= 0.0:
-            return False
-        if probability >= 1.0:
-            return True
-        return random.random() < probability
+            return False, "回复概率为 0"
+        if probability < 1.0 and random.random() >= probability:
+            return False, f"未命中概率（{probability}）"
+        return True, "命中"
 
     def _looks_like_command(self, content: str, cfg: Any) -> bool:
         """判断消息是否是指令（指令消息不参与主动回复）。"""
@@ -324,16 +506,17 @@ class ProactiveCompanionPlugin(Star):
         return any(prefix and content.startswith(prefix) for prefix in prefixes)
 
     def _in_reply_whitelist(self, event: AstrMessageEvent) -> bool:
-        """白名单判定：命中发送者 ID / 会话 ID / 群号 / umo 之一即可。"""
+        """白名单判定：命中发送者 ID / 会话 ID / 群号 / umo 之一即可。
+
+        白名单为空表示不做额外限制（谁都可以触发主动回复）；
+        填 `*` 语义相同。填写具体值后，只有命中者才会触发。
+        """
         whitelist = [
             str(item).strip()
             for item in self._cfg_list("proactive_reply_whitelist", [])
             if str(item).strip()
         ]
-        if not whitelist:
-            # 白名单为空 = 不允许任何人主动回复
-            return False
-        if "*" in whitelist:
+        if not whitelist or "*" in whitelist:
             return True
         candidates: set[str] = set()
         try:
@@ -398,7 +581,8 @@ class ProactiveCompanionPlugin(Star):
             note["last_mention_at"] = now
             update["note"] = json.dumps(note, ensure_ascii=False)
 
-        if content:
+        if content and not event.get_extra(_CAPTURED_FLAG, False):
+            # 被动采集已经记录过这条消息时不要重复入库
             await self.store.add_message(umo, "user", content, sender_name)
         if reply:
             await self.store.add_message(umo, "bot", reply, "bot")
@@ -838,6 +1022,37 @@ class ProactiveCompanionPlugin(Star):
         else:
             yield event.plain_result("消息发送失败了，请检查平台是否支持主动消息。")
 
+    @companion.command("诊断", alias={"debug", "diag"})
+    async def companion_diagnose(self, event: AstrMessageEvent):
+        """查看主动回复的判定状态，排查为什么没有触发"""
+        umo = event.unified_msg_origin
+        session = await self.store.get_session(umo)
+        lines = [
+            "【主动回复诊断】",
+            f"开关：{'开' if self._cfg_bool('proactive_reply_enabled', True) else '关'}",
+            f"概率：{self._cfg_float('proactive_reply_probability', 0.2)}",
+            f"冷却：{self._cfg_int('proactive_reply_cooldown_minutes', 10)} 分钟",
+            f"最短长度：{self._cfg_int('proactive_reply_min_length', 2)}",
+            f"白名单：{self._cfg_list('proactive_reply_whitelist', []) or '（空 = 不限制）'}",
+            f"免打扰：{self._cfg_list('quiet_hours', []) or '（未设置）'}",
+            f"上下文采集：{'开' if self._cfg_bool('capture_context_enabled', True) else '关'}"
+            f"（已跟踪 {len(self._tracked_sessions)} 个会话）",
+            f"最近判定：{self._last_reply_decision}",
+        ]
+        if self._reply_skip_reasons:
+            top = sorted(
+                self._reply_skip_reasons.items(), key=lambda kv: kv[1], reverse=True
+            )[:3]
+            lines.append("跳过原因 TOP3：" + "；".join(f"{k}×{v}" for k, v in top))
+        if session:
+            lines.append(
+                f"本会话：主动回复 {int(session.get('proactive_replies') or 0)} 次，"
+                f"记录消息 {len(await self.store.recent_messages(umo, 200))} 条"
+            )
+        else:
+            lines.append("本会话：还没有任何记录（说明消息没被采集到）")
+        yield event.plain_result("\n".join(lines))
+
     @companion.command("清空", alias={"clear", "reset"})
     async def companion_clear(self, event: AstrMessageEvent):
         """清空当前会话的记忆与情绪"""
@@ -998,6 +1213,18 @@ class ProactiveCompanionPlugin(Star):
                     "proactive_reply_whitelist", []
                 ),
                 "proactive_replies_total": reply_total,
+                "proactive_reply_last_decision": self._last_reply_decision,
+                "proactive_reply_skip_reasons": dict(
+                    sorted(
+                        self._reply_skip_reasons.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True,
+                    )[:5]
+                ),
+                "capture_context_enabled": self._cfg_bool(
+                    "capture_context_enabled", True
+                ),
+                "captured_sessions": len(self._tracked_sessions),
                 "data_dir": str(self.data_dir),
                 "server_time": now,
             }

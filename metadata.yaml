@@ -20,7 +20,7 @@ desc: |
   - **独立 WebUI**：插件自带可视化面板，可管理会话、情绪、配置与日志
 
   **指令**：`/陪伴 开启`、`/陪伴 关闭`、`/陪伴 状态`、`/陪伴 说说`、`/陪伴 清空`
-version: 1.0.1
+version: 1.0.2
 author: hongdougao111
 repo: https://github.com/hongdougao111/astrbot_plugin_proactive_companion
 social_link: https://github.com/hongdougao111

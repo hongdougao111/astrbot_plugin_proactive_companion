@@ -32,11 +32,15 @@
 3. 消息不是指令（`/` 开头或命中唤醒词），避免和指令回复撞车；
 4. 长度不小于 `proactive_reply_min_length`；
 5. 不在免打扰时段内；
-6. 发送者 ID / 群号 / 会话 ID 命中 `proactive_reply_whitelist`；
+6. 发送者 ID / 群号 / 会话 ID 命中 `proactive_reply_whitelist`（留空 = 不限制）；
 7. 距上次主动回复超过 `proactive_reply_cooldown_minutes`；
 8. 通过 `proactive_reply_probability` 的概率判定。
 
-白名单留空表示**不允许任何人**主动回复（白名单语义）；填 `*` 表示不限制。
+**上下文从哪来**：插件在后台被动采集会话里收到的消息（只存被跟踪的会话，数据在本地
+`data/plugin_data/`），主动回复时把最近若干条作为临时上下文注入本次 LLM 请求——
+所以它知道大家刚才在聊什么，而不是只看到触发的那一句。
+
+**排查**：发 `/陪伴 诊断`，或看插件可视化面板「概览」里的「最近判定 / 跳过原因」。
 
 ## 📦 安装
 
@@ -121,9 +125,27 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 python tests/test_proactive_companion.py
 ```
 
-当前结果：**77 项断言全部通过**。
+当前结果：**86 项断言全部通过**。
 
 ## 📋 更新日志
+
+### v1.0.2
+
+- **修复：主动回复不触发**。之前判定用的是 `event.is_wake`，而 AstrBot 里
+  **任何插件的监听器一旦通过过滤器就会把 `is_wake` 置为 True**，导致主动回复
+  每次都被自己挡掉。现改用 `is_at_or_wake_command`（只有被 @ / 唤醒词 / 私聊
+  才会置真）判断「机器人本来会不会回复」。
+- **修复：主动回复没有上下文**。AstrBot 自身的会话历史只包含「机器人参与过」的
+  对话，群里其他人聊天并不在里面。现在插件会在后台被动采集会话消息，并在主动回复
+  时通过 `on_llm_request` 把最近对话作为**临时内容**注入本次 LLM 请求
+  （标记为 temp，不会写入会话历史）。
+- **白名单语义调整**：留空 = 不限制（任何人都可能触发），填具体值才限制；
+  填 `*` 同样表示不限制。
+- `proactive_reply_enabled` 默认改为开启，`proactive_reply_probability` 默认 0.2。
+- 新增 `/陪伴 诊断` 指令与面板「最近判定 / 跳过原因 TOP」展示，
+  几秒内就能看出为什么没触发（开关、概率、冷却、白名单、免打扰、指令、消息过短）。
+- 新增配置：`capture_context_enabled`、`proactive_reply_context_messages`、
+  `capture_context_max_sessions`。
 
 ### v1.0.1
 
