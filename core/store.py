@@ -15,6 +15,21 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+try:  # 正常：作为 core 包的一部分被导入
+    from . import affection as affection_mod
+except ImportError:  # pragma: no cover - 独立加载时的兜底
+    import importlib.util
+    import sys as _sys
+
+    _spec = importlib.util.spec_from_file_location(
+        "pac_affection", str(Path(__file__).with_name("affection.py"))
+    )
+    _module = importlib.util.module_from_spec(_spec)
+    _sys.modules["pac_affection"] = _module
+    if _spec.loader is not None:
+        _spec.loader.exec_module(_module)
+    affection_mod = _module  # type: ignore[assignment]
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_key      TEXT PRIMARY KEY,
@@ -65,6 +80,21 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(id DESC);
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS user_profiles (
+    session_key   TEXT NOT NULL,
+    user_id       TEXT NOT NULL,
+    nickname      TEXT DEFAULT '',
+    affection     REAL NOT NULL DEFAULT 0,
+    tags          TEXT DEFAULT '[]',
+    note          TEXT DEFAULT '',
+    msg_count     INTEGER NOT NULL DEFAULT 0,
+    bot_replies   INTEGER NOT NULL DEFAULT 0,
+    first_seen    REAL NOT NULL DEFAULT 0,
+    last_seen     REAL NOT NULL DEFAULT 0,
+    affection_at  REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_key, user_id)
 );
 """
 
@@ -399,6 +429,165 @@ class Store:
                 return json.loads(row["atmosphere_data"])
             except (TypeError, ValueError):
                 return None
+
+        return await self._run(_do)
+
+    # ------------------------------------------------------------------
+    # 人物画像
+    # ------------------------------------------------------------------
+    async def touch_profile(
+        self,
+        session_key: str,
+        user_id: str,
+        nickname: str = "",
+        affection_delta: float = 0.0,
+        event: str = "",
+        positive: bool = False,
+        negative: bool = False,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """记录一次用户互动，并更新好感度。
+
+        affection_delta 为额外加减分（由情绪分析得出），
+        event 用于按事件类型追加基础分。
+        """
+        now = time.time() if now is None else now
+
+        def _do(conn: sqlite3.Connection) -> dict[str, Any]:
+            row = conn.execute(
+                "SELECT * FROM user_profiles WHERE session_key = ? AND user_id = ?",
+                (session_key, user_id),
+            ).fetchone()
+            if row is None:
+                score = 0.0
+                first_seen = now
+                msg_count = 0
+                bot_replies = 0
+            else:
+                score = float(row["affection"] or 0.0)
+                first_seen = float(row["first_seen"] or now)
+                msg_count = int(row["msg_count"] or 0)
+                bot_replies = int(row["bot_replies"] or 0)
+
+            # 先按无互动时长衰减
+            score = affection_mod.decayed(
+                score, float(row["affection_at"]) if row else 0.0, now
+            )
+            score = affection_mod.apply_event(
+                score, event, positive=positive, negative=negative
+            )
+            score = affection_mod.clamp(score + affection_delta)
+
+            if event == "user_message":
+                msg_count += 1
+            elif event in ("bot_reply", "proactive_reply"):
+                bot_replies += 1
+
+            conn.execute(
+                "INSERT INTO user_profiles (session_key, user_id, nickname, affection,"
+                " tags, note, msg_count, bot_replies, first_seen, last_seen,"
+                " affection_at) VALUES (?, ?, ?, ?, '[]', '', ?, ?, ?, ?, ?)"
+                " ON CONFLICT(session_key, user_id) DO UPDATE SET"
+                " nickname = excluded.nickname, affection = excluded.affection,"
+                " msg_count = excluded.msg_count, bot_replies = excluded.bot_replies,"
+                " last_seen = excluded.last_seen, affection_at = excluded.affection_at",
+                (
+                    session_key,
+                    user_id,
+                    nickname,
+                    score,
+                    msg_count,
+                    bot_replies,
+                    first_seen,
+                    now,
+                    now,
+                ),
+            )
+            out = conn.execute(
+                "SELECT * FROM user_profiles WHERE session_key = ? AND user_id = ?",
+                (session_key, user_id),
+            ).fetchone()
+            return dict(out) if out else {}
+
+        return await self._run(_do)
+
+    async def get_profile(
+        self, session_key: str, user_id: str
+    ) -> dict[str, Any] | None:
+        def _do(conn: sqlite3.Connection) -> dict[str, Any] | None:
+            row = conn.execute(
+                "SELECT * FROM user_profiles WHERE session_key = ? AND user_id = ?",
+                (session_key, user_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+        return await self._run(_do)
+
+    async def list_profiles(
+        self, session_key: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        def _do(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            if session_key:
+                rows = conn.execute(
+                    "SELECT * FROM user_profiles WHERE session_key = ?"
+                    " ORDER BY affection DESC LIMIT ?",
+                    (session_key, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM user_profiles ORDER BY affection DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+        return await self._run(_do)
+
+    async def update_profile_fields(
+        self,
+        session_key: str,
+        user_id: str,
+        *,
+        note: str | None = None,
+        tags: list[str] | None = None,
+        affection: float | None = None,
+        nickname: str | None = None,
+    ) -> dict[str, Any] | None:
+        """手动修改画像（备注 / 标签 / 好感度 / 昵称）。"""
+
+        def _do(conn: sqlite3.Connection) -> dict[str, Any] | None:
+            sets: list[str] = []
+            values: list[Any] = []
+            if note is not None:
+                sets.append("note = ?")
+                values.append(note)
+            if tags is not None:
+                sets.append("tags = ?")
+                values.append(json.dumps(tags, ensure_ascii=False))
+            if affection is not None:
+                sets.append("affection = ?")
+                values.append(affection_mod.clamp(float(affection)))
+                sets.append("affection_at = ?")
+                values.append(time.time())
+            if nickname is not None:
+                sets.append("nickname = ?")
+                values.append(nickname)
+            if not sets:
+                row = conn.execute(
+                    "SELECT * FROM user_profiles WHERE session_key = ? AND user_id = ?",
+                    (session_key, user_id),
+                ).fetchone()
+                return dict(row) if row else None
+            values.extend([session_key, user_id])
+            conn.execute(
+                f"UPDATE user_profiles SET {', '.join(sets)}"
+                " WHERE session_key = ? AND user_id = ?",
+                values,
+            )
+            row = conn.execute(
+                "SELECT * FROM user_profiles WHERE session_key = ? AND user_id = ?",
+                (session_key, user_id),
+            ).fetchone()
+            return dict(row) if row else None
 
         return await self._run(_do)
 

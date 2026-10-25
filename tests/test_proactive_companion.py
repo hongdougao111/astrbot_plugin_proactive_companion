@@ -1317,7 +1317,86 @@ async def main() -> None:
         block2[:120],
     )
 
-    print("\n== 21. 数据库迁移 ==")
+    print("\n== 21. 好感度与人物画像 ==")
+    from core import affection as aff  # type: ignore
+
+    # 等级判定
+    check("0 分 → 陌生", aff.level_of(0) == "陌生")
+    check("35 分 → 熟人", aff.level_of(35) == "熟人")
+    check("90 分 → 挚友", aff.level_of(90) == "挚友")
+    check("好感分被限制在 0~100", aff.clamp(200) == 100.0 and aff.clamp(-5) == 0.0)
+
+    # 事件加减分
+    s0 = aff.apply_event(0.0, "user_message")
+    check("用户发言会加分", s0 > 0)
+    s1 = aff.apply_event(s0, "bot_reply")
+    check("机器人回复会加分", s1 > s0)
+    s2 = aff.apply_event(s1, "proactive_reply")
+    check("主动搭话加分更多", s2 > s1)
+    s3 = aff.apply_event(s1, "user_message", negative=True)
+    check("负面情绪会扣分", s3 < s1)
+
+    # 衰减
+    import time as _time
+
+    decayed = aff.decayed(50.0, _time.time() - 86400 * 3)
+    check("长时间不互动会衰减", decayed < 50.0, f"{decayed}")
+
+    # 概率系数
+    check("好感越高越愿意搭话", aff.probability_factor(100) > aff.probability_factor(0))
+
+    # 落库与画像
+    aff_umo = "aiocqhttp:FriendMessage:aff1"
+    await plugin.store.touch_profile(
+        aff_umo, "u-aff", nickname="阿宝", event="user_message", positive=True
+    )
+    await plugin.store.touch_profile(
+        aff_umo, "u-aff", nickname="阿宝", event="bot_reply"
+    )
+    profile = await plugin.store.get_profile(aff_umo, "u-aff")
+    check("画像已落库", profile is not None)
+    check("画像记录了昵称", (profile or {}).get("nickname") == "阿宝")
+    check(
+        "好感度已累加",
+        float((profile or {}).get("affection") or 0) > 0,
+        str((profile or {}).get("affection")),
+    )
+    check(
+        "消息计数正确",
+        int((profile or {}).get("msg_count") or 0) == 1,
+        str((profile or {}).get("msg_count")),
+    )
+    check(
+        "机器人回应计数正确",
+        int((profile or {}).get("bot_replies") or 0) == 1,
+        str((profile or {}).get("bot_replies")),
+    )
+
+    # 修改画像
+    updated = await plugin.store.update_profile_fields(
+        aff_umo, "u-aff", note="技术大佬", tags=["朋友", "技术"], affection=66.0
+    )
+    check("备注已保存", (updated or {}).get("note") == "技术大佬")
+    check(
+        "标签已保存",
+        "技术" in str((updated or {}).get("tags") or ""),
+        str((updated or {}).get("tags")),
+    )
+    check("好感度可手动设置", float((updated or {}).get("affection") or 0) == 66.0)
+
+    # 画像渲染
+    text = await plugin._render_profile(updated or {})
+    check("画像含昵称", "阿宝" in text)
+    check("画像含好感等级", "亲近" in text, text[:200])
+    check("画像含备注", "技术大佬" in text)
+
+    # Web API
+    resp = await plugin.api_profiles()
+    check("画像列表接口可用", resp.payload.get("total", 0) >= 1)
+    resp = await plugin.api_update_profile()
+    check("画像修改缺参数时报错", resp.status_code == 400)
+
+    print("\n== 22. 数据库迁移 ==")
     import sqlite3 as _sqlite3
 
     db_path = plugin.store.db_path

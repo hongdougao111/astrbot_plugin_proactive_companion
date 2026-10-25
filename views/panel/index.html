@@ -24,6 +24,7 @@
     <nav class="tabs" id="tabs">
       <button class="tab active" data-tab="overview">概览</button>
       <button class="tab" data-tab="sessions">会话</button>
+      <button class="tab" data-tab="profiles">画像</button>
       <button class="tab" data-tab="config">配置</button>
       <button class="tab" data-tab="logs">日志</button>
     </nav>
@@ -78,6 +79,54 @@
         <div class="card block" id="message-card" hidden>
           <h2>消息记录 <button class="btn tiny ghost" id="btn-close-msgs">关闭</button></h2>
           <div class="messages" id="message-list"></div>
+        </div>
+      </section>
+
+      <!-- 画像 -->
+      <section class="panel" id="tab-profiles">
+        <div class="toolbar">
+          <span class="muted" id="profile-count"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>昵称</th>
+                <th>用户 ID</th>
+                <th>好感</th>
+                <th>互动</th>
+                <th>标签</th>
+                <th>备注</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="profile-rows"></tbody>
+          </table>
+        </div>
+        <div class="card block" id="profile-edit-card" hidden>
+          <h2>编辑画像</h2>
+          <div class="form-grid">
+            <div class="field">
+              <label for="pe-nickname">昵称</label>
+              <input type="text" id="pe-nickname" />
+            </div>
+            <div class="field">
+              <label for="pe-tags">标签（逗号分隔）</label>
+              <input type="text" id="pe-tags" />
+            </div>
+            <div class="field">
+              <label for="pe-affection">好感度（0-100）</label>
+              <input type="number" id="pe-affection" min="0" max="100" />
+            </div>
+            <div class="field">
+              <label for="pe-note">备注</label>
+              <textarea id="pe-note"></textarea>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn primary" id="btn-save-profile">保存画像</button>
+            <span class="muted" id="profile-tip"></span>
+          </div>
         </div>
       </section>
 

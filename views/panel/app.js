@@ -50,6 +50,7 @@ const CONFIG_FIELDS = [
   { key: "atmosphere_hot_rate", label: "热闹阈值(条/分钟)", type: "float", min: 0 },
   { key: "atmosphere_conflict_ratio", label: "紧张阈值(冲突占比)", type: "float", min: 0 },
   { key: "atmosphere_boost", label: "冷场概率放大倍数", type: "float", min: 0 },
+  { key: "affection_enabled", label: "启用好感度", type: "bool" },
   { key: "system_prompt", label: "人设提示词", type: "textarea" },
 ];
 
@@ -248,6 +249,65 @@ async function loadMessages(key) {
   $("#message-list").scrollTop = $("#message-list").scrollHeight;
 }
 
+// ---------------------------------------------------------------- 画像
+let editingProfile = null;
+
+async function loadProfiles() {
+  const data = await bridge.apiGet("profiles");
+  state.profiles = data.profiles || [];
+  $("#profile-count").textContent = `共 ${data.total ?? state.profiles.length} 份画像`;
+  $("#profile-rows").innerHTML =
+    state.profiles
+      .map((p) => {
+        const idx = p.level_index ?? 0;
+        const bar = "█".repeat(idx) + "░".repeat(4 - idx);
+        return `<tr data-key="${esc(p.session_key)}" data-user="${esc(p.user_id)}">
+        <td>${esc(p.nickname || "—")}</td>
+        <td class="name">${esc(p.user_id)}</td>
+        <td><span class="badge ${p.affection >= 30 ? "good" : ""}" title="${esc(p.level)}">${esc(
+      p.level
+    )} ${p.affection.toFixed(1)} <span class="muted">${bar}</span></span></td>
+        <td>${esc(p.msg_count)} / ${esc(p.bot_replies)}</td>
+        <td>${esc((p.tags || []).join("、") || "—")}</td>
+        <td class="name" title="${esc(p.note || "")}">${esc(p.note || "—")}</td>
+        <td><button class="btn tiny ghost" data-act="edit-profile">编辑</button></td>
+      </tr>`;
+      })
+      .join("") || `<tr><td colspan="7" class="muted">还没有画像，聊几句就会出现</td></tr>`;
+}
+
+function openProfileEditor(profile) {
+  editingProfile = profile;
+  $("#profile-edit-card").hidden = false;
+  $("#pe-nickname").value = profile.nickname || "";
+  $("#pe-tags").value = (profile.tags || []).join(", ");
+  $("#pe-affection").value = profile.affection ?? 0;
+  $("#pe-note").value = profile.note || "";
+  $("#profile-edit-card").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function saveProfile() {
+  if (!editingProfile) return;
+  const btn = $("#btn-save-profile");
+  btn.disabled = true;
+  try {
+    await bridge.apiPost("profiles/update", {
+      session_key: editingProfile.session_key,
+      user_id: editingProfile.user_id,
+      nickname: $("#pe-nickname").value,
+      tags: $("#pe-tags").value,
+      affection: Number($("#pe-affection").value),
+      note: $("#pe-note").value,
+    });
+    toast("画像已保存");
+    await loadProfiles();
+  } catch (err) {
+    toast(err.message || "保存失败", true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 // ---------------------------------------------------------------- 配置
 async function loadConfig() {
   const data = await bridge.apiGet("config");
@@ -348,6 +408,8 @@ function bindTabs() {
       if (panel) panel.classList.add("active");
       if (tab.dataset.tab === "sessions") loadSessions().catch((e) => toast(e.message, true));
       if (tab.dataset.tab === "config") loadConfig().catch((e) => toast(e.message, true));
+      if (tab.dataset.tab === "profiles")
+        loadProfiles().catch((e) => toast(e.message, true));
       if (tab.dataset.tab === "logs") loadEvents().catch((e) => toast(e.message, true));
     });
   });
@@ -356,7 +418,7 @@ function bindTabs() {
 function bindActions() {
   $("#btn-refresh").addEventListener("click", async () => {
     try {
-      await Promise.all([loadState(), loadSessions(), loadEvents()]);
+      await Promise.all([loadState(), loadSessions(), loadEvents(), loadProfiles()]);
       toast("已刷新");
     } catch (err) {
       toast(err.message || "刷新失败", true);
@@ -397,6 +459,19 @@ function bindActions() {
     const key = tr?.dataset.key;
     if (key) sessionAction(key, btn.dataset.act, btn);
   });
+
+  $("#profile-rows").addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button[data-act='edit-profile']");
+    if (!btn) return;
+    const tr = btn.closest("tr");
+    const profile = state.profiles.find(
+      (p) =>
+        p.session_key === tr?.dataset.key && p.user_id === tr?.dataset.user
+    );
+    if (profile) openProfileEditor(profile);
+  });
+
+  $("#btn-save-profile").addEventListener("click", saveProfile);
 }
 
 async function main() {
@@ -418,7 +493,7 @@ async function main() {
   bindActions();
 
   try {
-    await Promise.all([loadState(), loadSessions(), loadEvents()]);
+    await Promise.all([loadState(), loadSessions(), loadEvents(), loadProfiles()]);
   } catch (err) {
     toast(err.message || "加载失败", true);
   }

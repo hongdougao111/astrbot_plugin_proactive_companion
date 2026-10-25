@@ -39,7 +39,7 @@ except Exception:  # pragma: no cover - 极端情况下退回不注入
 
 try:
     # 正常情况：AstrBot 以 `data.plugins.<插件名>.main` 的形式加载插件，相对导入可用。
-    from .core import atmosphere, dnd, emotion, generator
+    from .core import affection, atmosphere, dnd, emotion, generator
     from .core.store import Store
 except ImportError:  # pragma: no cover - 兜底：插件被以独立脚本方式加载时
     import importlib
@@ -49,6 +49,7 @@ except ImportError:  # pragma: no cover - 兜底：插件被以独立脚本方�
     _plugin_dir = str(_Path(__file__).resolve().parent)
     if _plugin_dir not in _sys.path:
         _sys.path.insert(0, _plugin_dir)
+    affection = importlib.import_module("core.affection")
     atmosphere = importlib.import_module("core.atmosphere")
     dnd = importlib.import_module("core.dnd")
     emotion = importlib.import_module("core.emotion")
@@ -160,6 +161,8 @@ class ProactiveCompanionPlugin(Star):
         # 气氛缓存：session_key -> Atmosphere（供同步过滤器快速读取）
         self._atmosphere_cache: dict[str, Any] = {}
         self._atmosphere_refreshed_at: dict[str, float] = {}
+        # 好感度缓存：session_key|user_id -> 分数（供同步过滤器快速读取）
+        self._affection_cache: dict[str, float] = {}
         global _PLUGIN_REF
         _PLUGIN_REF = self
         self._register_web_apis()
@@ -342,6 +345,12 @@ class ProactiveCompanionPlugin(Star):
             limit = max(1, self._cfg_int("proactive_reply_context_messages", 12))
             messages = await self.store.recent_messages(umo, limit)
             hint = self._atmosphere_hint(umo)
+            try:
+                rel = self._relationship_hint(umo, str(event.get_sender_id() or ""))
+            except Exception:
+                rel = ""
+            if rel:
+                hint = f"{hint}\n{rel}".strip()
             if not messages and not hint:
                 return
             text = self._format_context_block(messages, hint)
@@ -462,6 +471,9 @@ class ProactiveCompanionPlugin(Star):
         )
         self._tracked_sessions.add(umo)
         await self.store.add_message(umo, "user", content, sender, sender_id)
+        await self._update_affection(
+            umo, sender_id, sender, content, event="user_message"
+        )
         try:
             event.set_extra(_CAPTURED_FLAG, True)
         except Exception:  # pragma: no cover
@@ -580,6 +592,20 @@ class ProactiveCompanionPlugin(Star):
                 "user",
                 (event.message_str or "").strip(),
                 event.get_sender_name() or "",
+                str(event.get_sender_id() or ""),
+            )
+        sender_id = ""
+        try:
+            sender_id = str(event.get_sender_id() or "")
+        except Exception:
+            sender_id = ""
+        if sender_id:
+            await self._update_affection(
+                umo,
+                sender_id,
+                event.get_sender_name() or "",
+                (event.message_str or "").strip(),
+                event="proactive_reply",
             )
         session = await self.store.get_session(umo)
         count = int((session or {}).get("proactive_replies") or 0) + 1
@@ -653,7 +679,17 @@ class ProactiveCompanionPlugin(Star):
             )
             if factor <= 0.0:
                 return False, f"气氛{state.level}，不插嘴"
-            probability = min(1.0, probability * factor)
+            if probability < 1.0:
+                probability = min(1.0, probability * factor)
+        # 好感度越高，越愿意主动搭话
+        # （概率配成 1.0 表示「总是回复」，此时不再做软调节）
+        if probability < 1.0 and self._cfg_bool("affection_enabled", True):
+            try:
+                sender_id = str(event.get_sender_id() or "")
+            except Exception:
+                sender_id = ""
+            score = self._affection_cached(umo, sender_id)
+            probability = min(1.0, probability * affection.probability_factor(score))
         if probability < 1.0 and random.random() >= probability:
             return False, f"未命中概率（{probability:.2f}）"
         return True, "命中"
@@ -759,10 +795,80 @@ class ProactiveCompanionPlugin(Star):
             await self.store.add_message(umo, "user", content, sender_name, sender_id)
         if reply:
             await self.store.add_message(umo, "bot", reply, "bot", "")
+            if sender_id:
+                await self._update_affection(
+                    umo, sender_id, sender_name, event="bot_reply"
+                )
         await self.store.update_session(umo, **update)
 
         if content and self._cfg_bool("mood_enabled", True):
             await self._apply_mood_event(umo, content)
+
+    async def _update_affection(
+        self,
+        session_key: str,
+        user_id: str,
+        nickname: str,
+        content: str = "",
+        event: str = "user_message",
+    ) -> None:
+        """根据一次互动更新好感度。"""
+        if not user_id:
+            return
+        if not self._cfg_bool("affection_enabled", True):
+            return
+        try:
+            positive = False
+            negative = False
+            if content:
+                dv, _da = emotion.analyze_text(content)
+                positive = dv > 0.2
+                negative = dv < -0.2
+            await self.store.touch_profile(
+                session_key,
+                user_id,
+                nickname=nickname,
+                event=event,
+                positive=positive,
+                negative=negative,
+            )
+            profile = await self.store.get_profile(session_key, user_id)
+            if profile:
+                self._affection_cache[self._affection_key(session_key, user_id)] = (
+                    float(profile.get("affection") or 0.0)
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.debug(f"[主动陪伴] 更新好感度失败: {exc}")
+
+    @staticmethod
+    def _affection_key(session_key: str, user_id: str) -> str:
+        return f"{session_key}|{user_id}"
+
+    async def _affection_of(self, session_key: str, user_id: str) -> float:
+        """读取某个用户当前的好感分（含衰减）。"""
+        cached = self._affection_cache.get(self._affection_key(session_key, user_id))
+        if cached is not None:
+            return affection.decayed(cached, 0.0)
+        profile = await self.store.get_profile(session_key, user_id)
+        if not profile:
+            return 0.0
+        return affection.decayed(
+            float(profile.get("affection") or 0.0),
+            float(profile.get("affection_at") or 0.0),
+        )
+
+    def _affection_cached(self, session_key: str, user_id: str) -> float:
+        """同步读取好感分（过滤器用）。"""
+        if not user_id:
+            return 0.0
+        return self._affection_cache.get(self._affection_key(session_key, user_id), 0.0)
+
+    def _relationship_hint(self, session_key: str, user_id: str) -> str:
+        """给模型的一句话关系提示。"""
+        if not user_id:
+            return ""
+        score = self._affection_cached(session_key, user_id)
+        return affection.relationship_hint(score)
 
     def _mentions_other(self, event: AstrMessageEvent) -> bool:
         """判断消息是否在 @ 别人（不是 @ 机器人）。
@@ -1267,6 +1373,158 @@ class ProactiveCompanionPlugin(Star):
             lines.append("气氛：暂无数据（读空气已关闭或还没算过）")
         yield event.plain_result("\n".join(lines))
 
+    @companion.command("好感", alias={"affection", "好感度"})
+    async def companion_affection(self, event: AstrMessageEvent):
+        """查看自己（或指定用户）的好感度"""
+        umo = event.unified_msg_origin
+        target_id = ""
+        args = (event.message_str or "").split()
+        if len(args) >= 2:
+            target_id = args[1].strip()
+        if not target_id:
+            try:
+                target_id = str(event.get_sender_id() or "")
+            except Exception:
+                target_id = ""
+        profile = await self.store.get_profile(umo, target_id)
+        if not profile:
+            yield event.plain_result(
+                "还没有关于 TA 的好感记录——先聊两句就有啦～"
+                if target_id
+                else "还没有你的好感记录，先聊两句吧～"
+            )
+            return
+        score = await self._affection_of(umo, target_id)
+        level = affection.level_of(score)
+        idx = affection.level_index(score)
+        bar = "█" * idx + "░" * (len(affection.LEVELS) - 1 - idx)
+        extra = ""
+        if target_id and target_id != str(event.get_sender_id() or ""):
+            extra = f"\n（{profile.get('nickname') or target_id}）"
+        yield event.plain_result(
+            f"好感度{extra}：{score:.1f} / 100\n"
+            f"关系：{level}  {bar}\n"
+            f"互动次数：{int(profile.get('msg_count') or 0)} 条"
+        )
+
+    @companion.command("画像", alias={"profile", "档案"})
+    async def companion_profile(self, event: AstrMessageEvent):
+        """查看人物画像"""
+        umo = event.unified_msg_origin
+        args = (event.message_str or "").split()
+        target_id = args[1].strip() if len(args) >= 2 else ""
+        if not target_id:
+            try:
+                target_id = str(event.get_sender_id() or "")
+            except Exception:
+                target_id = ""
+        profiles = await self.store.list_profiles(umo)
+        profile = None
+        for item in profiles:
+            if str(item.get("user_id")) == target_id:
+                profile = item
+                break
+        if profile is None:
+            yield event.plain_result("还没有这个人的画像，聊几句就会出现啦～")
+            return
+        yield event.plain_result(await self._render_profile(profile))
+
+    @companion.command("改画像", alias={"setprofile", "编辑画像"})
+    async def companion_edit_profile(self, event: AstrMessageEvent):
+        """修改人物画像：/陪伴 改画像 <用户ID> 备注=xxx 标签=a,b 好感=50"""
+        umo = event.unified_msg_origin
+        raw = (event.message_str or "").strip()
+        parts = raw.split(None, 1)
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if not rest:
+            yield event.plain_result(
+                "用法：/陪伴 改画像 <用户ID> 备注=这是备注 标签=朋友,技术宅 好感=60"
+            )
+            return
+        fields = rest.split()
+        target_id = fields[0]
+        note = None
+        tags = None
+        affection_value = None
+        nickname = None
+        for item in fields[1:]:
+            if "=" not in item:
+                continue
+            key, _, value = item.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if key in ("备注", "note"):
+                note = value
+            elif key in ("标签", "tags"):
+                tags = [
+                    t.strip() for t in value.replace("，", ",").split(",") if t.strip()
+                ]
+            elif key in ("好感", "好感度", "affection"):
+                try:
+                    affection_value = float(value)
+                except (TypeError, ValueError):
+                    yield event.plain_result("好感值要是一个数字哦")
+                    return
+            elif key in ("昵称", "name"):
+                nickname = value
+        if (
+            note is None
+            and tags is None
+            and affection_value is None
+            and nickname is None
+        ):
+            yield event.plain_result(
+                "没看懂要改什么。可用字段：备注=xxx 标签=a,b 好感=60 昵称=xxx"
+            )
+            return
+        profile = await self.store.update_profile_fields(
+            umo,
+            target_id,
+            note=note,
+            tags=tags,
+            affection=affection_value,
+            nickname=nickname,
+        )
+        if profile is None:
+            yield event.plain_result("没找到这个人的画像，先聊两句试试～")
+            return
+        if affection_value is not None:
+            self._affection_cache[self._affection_key(umo, target_id)] = float(
+                profile.get("affection") or 0.0
+            )
+        yield event.plain_result("已更新画像：\n" + await self._render_profile(profile))
+
+    async def _render_profile(self, profile: dict[str, Any]) -> str:
+        """把一条画像渲染成可读文本。"""
+        score = await self._affection_of(
+            str(profile.get("session_key") or ""),
+            str(profile.get("user_id") or ""),
+        )
+        level = affection.level_of(score)
+        try:
+            tags = json.loads(profile.get("tags") or "[]")
+        except (TypeError, ValueError):
+            tags = []
+        nickname = str(profile.get("nickname") or "") or "（未设置昵称）"
+        user_id = str(profile.get("user_id") or "")
+        first_seen = float(profile.get("first_seen") or 0)
+        last_seen = float(profile.get("last_seen") or 0)
+        fmt = "%Y-%m-%d %H:%M"
+        lines = [
+            f"人物画像：{nickname}",
+            f"用户 ID：{user_id}",
+            f"好感度：{score:.1f} / 100（{level}）",
+            f"互动：{int(profile.get('msg_count') or 0)} 条消息，"
+            f"机器人回应 {int(profile.get('bot_replies') or 0)} 次",
+            f"首次出现：{time.strftime(fmt, time.localtime(first_seen)) if first_seen else '—'}",
+            f"最近出现：{time.strftime(fmt, time.localtime(last_seen)) if last_seen else '—'}",
+        ]
+        if tags:
+            lines.append("标签：" + "、".join(str(t) for t in tags))
+        note = str(profile.get("note") or "")
+        lines.append("备注：" + (note if note else "（暂无）"))
+        return "\n".join(lines)
+
     @companion.command("清空", alias={"clear", "reset"})
     async def companion_clear(self, event: AstrMessageEvent):
         """清空当前会话的记忆与情绪"""
@@ -1370,6 +1628,111 @@ class ProactiveCompanionPlugin(Star):
         ctx.register_web_api(
             f"/{PLUGIN_NAME}/export", self.api_export, ["GET"], "导出全部数据"
         )
+        ctx.register_web_api(
+            f"/{PLUGIN_NAME}/profiles",
+            self.api_profiles,
+            ["GET"],
+            "人物画像列表",
+        )
+        ctx.register_web_api(
+            f"/{PLUGIN_NAME}/profiles/update",
+            self.api_update_profile,
+            ["POST"],
+            "修改人物画像",
+        )
+        ctx.register_web_api(
+            f"/{PLUGIN_NAME}/profiles/detail",
+            self.api_profile_detail,
+            ["GET"],
+            "人物画像详情",
+        )
+
+    async def api_profiles(self):
+        """人物画像列表（含好感度）。"""
+        session_key = (request.query.get("session_key") or "").strip() or None
+        profiles = await self.store.list_profiles(session_key)
+        items = []
+        for profile in profiles:
+            skey = str(profile.get("session_key") or "")
+            uid = str(profile.get("user_id") or "")
+            score = await self._affection_of(skey, uid)
+            try:
+                tags = json.loads(profile.get("tags") or "[]")
+            except (TypeError, ValueError):
+                tags = []
+            items.append(
+                {
+                    "session_key": skey,
+                    "user_id": uid,
+                    "nickname": profile.get("nickname") or "",
+                    "affection": round(score, 2),
+                    "level": affection.level_of(score),
+                    "level_index": affection.level_index(score),
+                    "tags": tags,
+                    "note": profile.get("note") or "",
+                    "msg_count": int(profile.get("msg_count") or 0),
+                    "bot_replies": int(profile.get("bot_replies") or 0),
+                    "first_seen": float(profile.get("first_seen") or 0),
+                    "last_seen": float(profile.get("last_seen") or 0),
+                }
+            )
+        return json_response({"profiles": items, "total": len(items)})
+
+    async def api_profile_detail(self):
+        """单个人物画像详情。"""
+        session_key = (request.query.get("session_key") or "").strip()
+        user_id = (request.query.get("user_id") or "").strip()
+        if not session_key or not user_id:
+            return error_response("缺少 session_key 或 user_id")
+        profile = await self.store.get_profile(session_key, user_id)
+        if profile is None:
+            return error_response("画像不存在", status_code=404)
+        score = await self._affection_of(session_key, user_id)
+        try:
+            tags = json.loads(profile.get("tags") or "[]")
+        except (TypeError, ValueError):
+            tags = []
+        profile = dict(profile)
+        profile["tags"] = tags
+        profile["affection"] = round(score, 2)
+        profile["level"] = affection.level_of(score)
+        profile["text"] = await self._render_profile(profile)
+        return json_response({"profile": profile})
+
+    async def api_update_profile(self):
+        """修改人物画像：备注 / 标签 / 好感度 / 昵称。"""
+        payload = await request.json(default={})
+        session_key = str(payload.get("session_key") or "").strip()
+        user_id = str(payload.get("user_id") or "").strip()
+        if not session_key or not user_id:
+            return error_response("缺少 session_key 或 user_id")
+        note = payload.get("note")
+        tags = payload.get("tags")
+        nickname = payload.get("nickname")
+        affection_value = payload.get("affection")
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.replace("，", ",").split(",") if t.strip()]
+        if affection_value is not None:
+            try:
+                affection_value = float(affection_value)
+            except (TypeError, ValueError):
+                return error_response("好感值必须是数字")
+        profile = await self.store.update_profile_fields(
+            session_key,
+            user_id,
+            note=note if isinstance(note, str) else None,
+            tags=tags if isinstance(tags, list) else None,
+            affection=affection_value,
+            nickname=nickname if isinstance(nickname, str) else None,
+        )
+        if profile is None:
+            return error_response("画像不存在", status_code=404)
+        if affection_value is not None:
+            self._affection_cache[self._affection_key(session_key, user_id)] = float(
+                profile.get("affection") or 0.0
+            )
+        await self.store.add_event("profile_updated", session_key, {"user_id": user_id})
+        return json_response({"saved": True, "profile": profile})
 
     async def api_state(self):
         """概览信息。"""

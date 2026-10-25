@@ -224,5 +224,11 @@
     "type": "float",
     "default": 1.5,
     "hint": "气氛冷清时，主动回复的概率乘以该倍数。"
+  },
+  "affection_enabled": {
+    "description": "启用好感度",
+    "type": "bool",
+    "default": true,
+    "hint": "记录 Bot 与每个用户的长期关系（好感度），关系越好越愿意主动搭话。"
   }
 }
