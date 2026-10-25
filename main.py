@@ -1258,6 +1258,7 @@ class ProactiveCompanionPlugin(Star):
     def companion(self):
         """主动陪伴相关指令"""
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("开启", alias={"on", "enable", "start"})
     async def companion_enable(self, event: AstrMessageEvent):
         """为当前会话开启主动消息"""
@@ -1273,6 +1274,7 @@ class ProactiveCompanionPlugin(Star):
         await self.store.add_event("session_enabled", umo)
         yield event.plain_result("已开启主动陪伴，我会找机会跟你说话的～")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("关闭", alias={"off", "disable", "stop"})
     async def companion_disable(self, event: AstrMessageEvent):
         """为当前会话关闭主动消息"""
@@ -1281,6 +1283,7 @@ class ProactiveCompanionPlugin(Star):
         await self.store.add_event("session_disabled", umo)
         yield event.plain_result("已关闭主动陪伴，我会安静待着的。")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("状态", alias={"status"})
     async def companion_status(self, event: AstrMessageEvent):
         """查看当前会话的主动陪伴状态"""
@@ -1309,6 +1312,7 @@ class ProactiveCompanionPlugin(Star):
         )
         yield event.plain_result(text)
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("说说", alias={"talk", "speak"})
     async def companion_talk(self, event: AstrMessageEvent):
         """立刻触发一条主动消息"""
@@ -1344,6 +1348,7 @@ class ProactiveCompanionPlugin(Star):
         else:
             yield event.plain_result("消息发送失败了，请检查平台是否支持主动消息。")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("诊断", alias={"debug", "diag"})
     async def companion_diagnose(self, event: AstrMessageEvent):
         """查看主动回复的判定状态，排查为什么没有触发"""
@@ -1448,6 +1453,7 @@ class ProactiveCompanionPlugin(Star):
                 )
         return None
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("好感", alias={"affection", "好感度"})
     async def companion_affection(self, event: AstrMessageEvent):
         """查看自己（或指定用户）的好感度"""
@@ -1488,6 +1494,7 @@ class ProactiveCompanionPlugin(Star):
             f"互动次数：{int(profile.get('msg_count') or 0)} 条"
         )
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("画像", alias={"profile", "档案"})
     async def companion_profile(self, event: AstrMessageEvent):
         """查看人物画像"""
@@ -1517,6 +1524,7 @@ class ProactiveCompanionPlugin(Star):
             return
         yield event.plain_result(await self._render_profile(profile))
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("改画像", alias={"setprofile", "编辑画像"})
     async def companion_edit_profile(self, event: AstrMessageEvent):
         """修改人物画像：/陪伴 改画像 <用户ID> 备注=xxx 标签=a,b 好感=60"""
@@ -1592,6 +1600,7 @@ class ProactiveCompanionPlugin(Star):
             )
         yield event.plain_result("已更新画像：\n" + await self._render_profile(profile))
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("重建画像", alias={"rebuild", "回填画像"})
     async def companion_rebuild_profile(self, event: AstrMessageEvent):
         """用历史聊天记录补全人物画像"""
@@ -1652,6 +1661,7 @@ class ProactiveCompanionPlugin(Star):
                 lines.append(f"  · [{when}] {content}")
         return "\n".join(lines)
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("清空", alias={"clear", "reset"})
     async def companion_clear(self, event: AstrMessageEvent):
         """清空当前会话的记忆与情绪"""

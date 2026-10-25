@@ -378,6 +378,7 @@ def build_fake_astrbot(request_holder: dict[str, MockRequest]) -> None:
         @staticmethod
         def permission_type(kind: Any):
             def decorator(func):
+                func._permission_type = kind
                 return func
 
             return decorator
@@ -430,7 +431,11 @@ def build_fake_astrbot(request_holder: dict[str, MockRequest]) -> None:
         setattr(api_filter, _fn_name, getattr(_Filter, _fn_name))
     api_filter.CustomFilter = CustomFilter
     api_filter.EventMessageType = EventMessageType
-    api_filter.PermissionType = type("PermissionType", (), {})
+    api_filter.PermissionType = type(
+        "PermissionType",
+        (),
+        {"ADMIN": "admin", "MEMBER": "member", "GROUP_ADMIN": "group_admin"},
+    )
     api_filter.PlatformAdapterType = type("PlatformAdapterType", (), {})
     api_event.filter = api_filter  # type: ignore[assignment]
     sys.modules["astrbot.api.event.filter"] = api_filter
@@ -1507,6 +1512,16 @@ async def main() -> None:
         await plugin.store.get_profile(aff_umo, "u-aff") or {}
     )
     check("画像展示最近说过的话", "今天天气不错" in aff_text, aff_text[:400])
+
+    # 23.6 指令仅限管理员使用
+    cmds = getattr(plugin.companion, "commands", {})
+    check("指令组下有 10 条子指令", len(cmds) == 10, str(sorted(cmds)))
+    non_admin = [
+        name
+        for name, func in cmds.items()
+        if getattr(func, "_permission_type", None) != "admin"
+    ]
+    check("所有指令都限制为管理员", not non_admin, str(non_admin))
 
     shutil.rmtree(tmp, ignore_errors=True)
 
