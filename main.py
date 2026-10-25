@@ -21,6 +21,7 @@ import asyncio
 import datetime as _dt
 import json
 import random
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -284,6 +285,13 @@ class ProactiveCompanionPlugin(Star):
             self._task = asyncio.create_task(self._run_loop())
             logger.info("[主动陪伴] 调度器已启动。")
         await self.store.add_event("plugin_loaded", payload={"time": _now_str()})
+        # 用历史聊天记录补全人物画像（升级前的聊天也算数）
+        try:
+            count = await self.store.backfill_profiles()
+            if count:
+                logger.info(f"[主动陪伴] 已根据历史记录补全 {count} 份人物画像。")
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"[主动陪伴] 补全人物画像失败: {exc}")
 
     async def terminate(self) -> None:
         """插件卸载时停止调度循环。"""
@@ -845,17 +853,21 @@ class ProactiveCompanionPlugin(Star):
         return f"{session_key}|{user_id}"
 
     async def _affection_of(self, session_key: str, user_id: str) -> float:
-        """读取某个用户当前的好感分（含衰减）。"""
+        """读取某个用户当前的好感分（含衰减）。
+
+        以数据库为准，这样手动改过的好感度能立刻生效；
+        数据库里没有记录时才回退到内存缓存。
+        """
+        profile = await self.store.get_profile(session_key, user_id)
+        if profile:
+            return affection.decayed(
+                float(profile.get("affection") or 0.0),
+                float(profile.get("affection_at") or 0.0),
+            )
         cached = self._affection_cache.get(self._affection_key(session_key, user_id))
         if cached is not None:
             return affection.decayed(cached, 0.0)
-        profile = await self.store.get_profile(session_key, user_id)
-        if not profile:
-            return 0.0
-        return affection.decayed(
-            float(profile.get("affection") or 0.0),
-            float(profile.get("affection_at") or 0.0),
-        )
+        return 0.0
 
     def _affection_cached(self, session_key: str, user_id: str) -> float:
         """同步读取好感分（过滤器用）。"""
@@ -1373,34 +1385,103 @@ class ProactiveCompanionPlugin(Star):
             lines.append("气氛：暂无数据（读空气已关闭或还没算过）")
         yield event.plain_result("\n".join(lines))
 
+    # ------------------------------------------------------------------
+    # 指令参数解析
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _cmd_tail(event: AstrMessageEvent, *names: str) -> str:
+        """取出「陪伴 <子指令>」之后的参数文本。
+
+        AstrBot 的指令组只做整词前缀匹配，**不会**把子指令名从
+        ``event.message_str`` 里剥掉，所以这里按子指令名（含别名）
+        定位，取其后的部分作为参数。
+        """
+        raw = re.sub(r"\s+", " ", (event.message_str or "").strip())
+        if not raw:
+            return ""
+        tokens = raw.split(" ")
+        for idx, token in enumerate(tokens):
+            if token in names:
+                return " ".join(tokens[idx + 1 :]).strip()
+        return ""
+
+    @staticmethod
+    def _parse_kv(text: str) -> dict[str, str]:
+        """解析 ``键=值`` 片段，允许值里带空格。
+
+        例如 ``备注=技术大佬 标签=朋友,技术宅`` →
+        ``{"备注": "技术大佬", "标签": "朋友,技术宅"}``
+        """
+        result: dict[str, str] = {}
+        for match in re.finditer(r"([^\s=]+)=(.*?)(?=(?:\s+[^\s=]+=)|$)", text or ""):
+            key = match.group(1).strip()
+            value = match.group(2).strip()
+            if key:
+                result[key] = value
+        return result
+
+    async def _resolve_profile(
+        self, session_key: str, target: str
+    ) -> tuple[str, str] | None:
+        """把「用户 ID 或昵称」解析成 (session_key, user_id)。
+
+        先在当前会话里找，找不到再在所有会话里找。
+        """
+        target = (target or "").strip()
+        if not target:
+            return None
+        current = await self.store.list_profiles(session_key)
+        for item in current:
+            if str(item.get("user_id")) == target:
+                return session_key, target
+        for item in current:
+            if str(item.get("nickname") or "") == target:
+                return session_key, str(item.get("user_id") or "")
+        others = await self.store.list_profiles(None)
+        for item in others:
+            if str(item.get("user_id")) == target:
+                return str(item.get("session_key") or ""), target
+        for item in others:
+            if str(item.get("nickname") or "") == target:
+                return str(item.get("session_key") or ""), str(
+                    item.get("user_id") or ""
+                )
+        return None
+
     @companion.command("好感", alias={"affection", "好感度"})
     async def companion_affection(self, event: AstrMessageEvent):
         """查看自己（或指定用户）的好感度"""
         umo = event.unified_msg_origin
-        target_id = ""
-        args = (event.message_str or "").split()
-        if len(args) >= 2:
-            target_id = args[1].strip()
-        if not target_id:
-            try:
-                target_id = str(event.get_sender_id() or "")
-            except Exception:
-                target_id = ""
-        profile = await self.store.get_profile(umo, target_id)
-        if not profile:
-            yield event.plain_result(
-                "还没有关于 TA 的好感记录——先聊两句就有啦～"
-                if target_id
-                else "还没有你的好感记录，先聊两句吧～"
-            )
+        tail = self._cmd_tail(event, "好感", "affection", "好感度")
+        target = tail.split(" ")[0] if tail else ""
+        self_id = ""
+        try:
+            self_id = str(event.get_sender_id() or "")
+        except Exception:
+            self_id = ""
+        if not target or target in ("我", "自己", "me", "本人"):
+            target = self_id
+        resolved = await self._resolve_profile(umo, target)
+        if resolved is None:
+            if target and target != self_id:
+                yield event.plain_result(
+                    f"没有找到「{target}」的好感记录——先和 TA 聊两句就有啦～"
+                )
+            else:
+                yield event.plain_result("还没有你的好感记录，先聊两句吧～")
             return
-        score = await self._affection_of(umo, target_id)
+        skey, uid = resolved
+        profile = await self.store.get_profile(skey, uid)
+        if not profile:
+            yield event.plain_result("还没有好感记录，先聊两句吧～")
+            return
+        score = await self._affection_of(skey, uid)
         level = affection.level_of(score)
         idx = affection.level_index(score)
         bar = "█" * idx + "░" * (len(affection.LEVELS) - 1 - idx)
         extra = ""
-        if target_id and target_id != str(event.get_sender_id() or ""):
-            extra = f"\n（{profile.get('nickname') or target_id}）"
+        if uid != self_id:
+            extra = f"（{profile.get('nickname') or uid}）"
         yield event.plain_result(
             f"好感度{extra}：{score:.1f} / 100\n"
             f"关系：{level}  {bar}\n"
@@ -1411,48 +1492,65 @@ class ProactiveCompanionPlugin(Star):
     async def companion_profile(self, event: AstrMessageEvent):
         """查看人物画像"""
         umo = event.unified_msg_origin
-        args = (event.message_str or "").split()
-        target_id = args[1].strip() if len(args) >= 2 else ""
-        if not target_id:
-            try:
-                target_id = str(event.get_sender_id() or "")
-            except Exception:
-                target_id = ""
-        profiles = await self.store.list_profiles(umo)
-        profile = None
-        for item in profiles:
-            if str(item.get("user_id")) == target_id:
-                profile = item
-                break
-        if profile is None:
+        tail = self._cmd_tail(event, "画像", "profile", "档案")
+        target = tail.split(" ")[0] if tail else ""
+        self_id = ""
+        try:
+            self_id = str(event.get_sender_id() or "")
+        except Exception:
+            self_id = ""
+        if not target or target in ("我", "自己", "me", "本人"):
+            target = self_id
+        resolved = await self._resolve_profile(umo, target)
+        if resolved is None:
+            if target and target != self_id:
+                yield event.plain_result(
+                    f"还没有「{target}」的画像，聊几句就会出现啦～"
+                )
+            else:
+                yield event.plain_result("还没有你的画像，聊两句就会出现啦～")
+            return
+        skey, uid = resolved
+        profile = await self.store.get_profile(skey, uid)
+        if not profile:
             yield event.plain_result("还没有这个人的画像，聊几句就会出现啦～")
             return
         yield event.plain_result(await self._render_profile(profile))
 
     @companion.command("改画像", alias={"setprofile", "编辑画像"})
     async def companion_edit_profile(self, event: AstrMessageEvent):
-        """修改人物画像：/陪伴 改画像 <用户ID> 备注=xxx 标签=a,b 好感=50"""
+        """修改人物画像：/陪伴 改画像 <用户ID> 备注=xxx 标签=a,b 好感=60"""
         umo = event.unified_msg_origin
-        raw = (event.message_str or "").strip()
-        parts = raw.split(None, 1)
-        rest = parts[1].strip() if len(parts) > 1 else ""
-        if not rest:
+        tail = self._cmd_tail(event, "改画像", "setprofile", "编辑画像")
+        if not tail:
             yield event.plain_result(
                 "用法：/陪伴 改画像 <用户ID> 备注=这是备注 标签=朋友,技术宅 好感=60"
             )
             return
-        fields = rest.split()
-        target_id = fields[0]
+        parts = tail.split(" ", 1)
+        target = parts[0].strip()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        self_id = ""
+        try:
+            self_id = str(event.get_sender_id() or "")
+        except Exception:
+            self_id = ""
+        if target in ("我", "自己", "me", "本人"):
+            target = self_id
+        resolved = await self._resolve_profile(umo, target)
+        if resolved is None:
+            yield event.plain_result(
+                f"没有找到「{target}」的画像，先聊两句试试～"
+                "（也可以用昵称指定，比如：/陪伴 改画像 阿宝 备注=技术大佬）"
+            )
+            return
+        skey, uid = resolved
+        fields = self._parse_kv(rest)
         note = None
         tags = None
         affection_value = None
         nickname = None
-        for item in fields[1:]:
-            if "=" not in item:
-                continue
-            key, _, value = item.partition("=")
-            key = key.strip()
-            value = value.strip()
+        for key, value in fields.items():
             if key in ("备注", "note"):
                 note = value
             elif key in ("标签", "tags"):
@@ -1478,8 +1576,8 @@ class ProactiveCompanionPlugin(Star):
             )
             return
         profile = await self.store.update_profile_fields(
-            umo,
-            target_id,
+            skey,
+            uid,
             note=note,
             tags=tags,
             affection=affection_value,
@@ -1489,24 +1587,35 @@ class ProactiveCompanionPlugin(Star):
             yield event.plain_result("没找到这个人的画像，先聊两句试试～")
             return
         if affection_value is not None:
-            self._affection_cache[self._affection_key(umo, target_id)] = float(
+            self._affection_cache[self._affection_key(skey, uid)] = float(
                 profile.get("affection") or 0.0
             )
         yield event.plain_result("已更新画像：\n" + await self._render_profile(profile))
 
+    @companion.command("重建画像", alias={"rebuild", "回填画像"})
+    async def companion_rebuild_profile(self, event: AstrMessageEvent):
+        """用历史聊天记录补全人物画像"""
+        try:
+            count = await self.store.backfill_profiles()
+        except Exception as exc:  # pragma: no cover
+            yield event.plain_result(f"重建失败：{exc}")
+            return
+        await self.store.add_event("profile_rebuilt", event.unified_msg_origin)
+        yield event.plain_result(
+            f"已根据历史聊天记录重建 {count} 份画像（含消息数、首末出现时间等）。"
+        )
+
     async def _render_profile(self, profile: dict[str, Any]) -> str:
         """把一条画像渲染成可读文本。"""
-        score = await self._affection_of(
-            str(profile.get("session_key") or ""),
-            str(profile.get("user_id") or ""),
-        )
+        session_key = str(profile.get("session_key") or "")
+        user_id = str(profile.get("user_id") or "")
+        score = await self._affection_of(session_key, user_id)
         level = affection.level_of(score)
         try:
             tags = json.loads(profile.get("tags") or "[]")
         except (TypeError, ValueError):
             tags = []
         nickname = str(profile.get("nickname") or "") or "（未设置昵称）"
-        user_id = str(profile.get("user_id") or "")
         first_seen = float(profile.get("first_seen") or 0)
         last_seen = float(profile.get("last_seen") or 0)
         fmt = "%Y-%m-%d %H:%M"
@@ -1523,6 +1632,24 @@ class ProactiveCompanionPlugin(Star):
             lines.append("标签：" + "、".join(str(t) for t in tags))
         note = str(profile.get("note") or "")
         lines.append("备注：" + (note if note else "（暂无）"))
+        # 聊天足迹：把这个人最近说过的话也带进画像
+        try:
+            recent = await self.store.recent_user_messages(session_key, user_id, 5)
+        except Exception:  # pragma: no cover
+            recent = []
+        if recent:
+            lines.append("最近说过：")
+            for item in recent:
+                content = str(item.get("content") or "").replace("\n", " ").strip()
+                if not content:
+                    continue
+                if len(content) > 40:
+                    content = content[:40] + "…"
+                stamp = float(item.get("ts") or 0)
+                when = (
+                    time.strftime("%m-%d %H:%M", time.localtime(stamp)) if stamp else ""
+                )
+                lines.append(f"  · [{when}] {content}")
         return "\n".join(lines)
 
     @companion.command("清空", alias={"clear", "reset"})
@@ -1646,6 +1773,21 @@ class ProactiveCompanionPlugin(Star):
             ["GET"],
             "人物画像详情",
         )
+        ctx.register_web_api(
+            f"/{PLUGIN_NAME}/profiles/rebuild",
+            self.api_rebuild_profiles,
+            ["POST"],
+            "用历史聊天记录重建人物画像",
+        )
+
+    async def api_rebuild_profiles(self):
+        """用历史聊天记录回填人物画像。"""
+        try:
+            count = await self.store.backfill_profiles()
+        except Exception as exc:  # pragma: no cover
+            return error_response(f"重建失败：{exc}", status_code=500)
+        await self.store.add_event("profile_rebuilt", "")
+        return json_response({"rebuilt": count})
 
     async def api_profiles(self):
         """人物画像列表（含好感度）。"""
@@ -1710,6 +1852,11 @@ class ProactiveCompanionPlugin(Star):
         tags = payload.get("tags")
         nickname = payload.get("nickname")
         affection_value = payload.get("affection")
+        # 昵称没改动时不要标记为「手动设置」，否则平台昵称后续就再也更新不了
+        if isinstance(nickname, str) and nickname.strip():
+            current = await self.store.get_profile(session_key, user_id)
+            if current and str(current.get("nickname") or "") == nickname:
+                nickname = None
         if isinstance(tags, str):
             tags = [t.strip() for t in tags.replace("，", ",").split(",") if t.strip()]
         if affection_value is not None:

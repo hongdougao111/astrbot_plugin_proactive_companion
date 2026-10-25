@@ -472,6 +472,22 @@ function bindActions() {
   });
 
   $("#btn-save-profile").addEventListener("click", saveProfile);
+
+  const rebuildBtn = $("#btn-rebuild-profiles");
+  if (rebuildBtn) {
+    rebuildBtn.addEventListener("click", async () => {
+      rebuildBtn.disabled = true;
+      try {
+        const data = await bridge.apiPost("profiles/rebuild", {});
+        toast(`已用历史记录补全 ${data.rebuilt ?? 0} 份画像`);
+        await loadProfiles();
+      } catch (err) {
+        toast(err.message || "补全失败", true);
+      } finally {
+        rebuildBtn.disabled = false;
+      }
+    });
+  }
 }
 
 async function main() {

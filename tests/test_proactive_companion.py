@@ -1407,6 +1407,107 @@ async def main() -> None:
     check("sessions 表含 atmosphere_level 列", "atmosphere_level" in cols)
     check("sessions 表含 atmosphere_data 列", "atmosphere_data" in cols)
 
+    conn = _sqlite3.connect(str(db_path))
+    prof_cols = {row[1] for row in conn.execute("PRAGMA table_info(user_profiles)")}
+    conn.close()
+    check("user_profiles 表含 nickname_manual 列", "nickname_manual" in prof_cols)
+
+    print("\n== 23. v1.0.7 修复：指令解析 / 画像生效 / 历史回填 ==")
+
+    # 23.1 指令参数解析（AstrBot 不会剥离子指令名）
+    ev = MockEvent(aff_umo, "陪伴 好感 u-aff")
+    tail = plugin._cmd_tail(ev, "好感", "affection", "好感度")
+    check("指令参数能剥离子指令名", tail == "u-aff", repr(tail))
+
+    ev = MockEvent(aff_umo, "陪伴 改画像 u-aff 备注=技术大佬 标签=朋友,技术 好感=60")
+    tail = plugin._cmd_tail(ev, "改画像", "setprofile", "编辑画像")
+    kv = plugin._parse_kv(tail.split(" ", 1)[1] if " " in tail else "")
+    check(
+        "改画像参数解析正确",
+        kv.get("备注") == "技术大佬" and kv.get("标签") == "朋友,技术",
+        str(kv),
+    )
+    check("改画像能取到好感值", kv.get("好感") == "60", str(kv))
+
+    # 23.2 指令真的能跑通（原来取错 token 导致「没反应」）
+    res = await mock_await_result(
+        plugin.companion_affection(MockEvent(aff_umo, "陪伴 好感 u-aff"))
+    )
+    check(
+        "好感指令能返回目标用户的好感",
+        res is not None and "好感度" in res[1] and "阿宝" in res[1],
+        str(res),
+    )
+
+    res = await mock_await_result(
+        plugin.companion_profile(MockEvent(aff_umo, "陪伴 画像 u-aff"))
+    )
+    check(
+        "画像指令能返回目标用户的画像", res is not None and "阿宝" in res[1], str(res)
+    )
+
+    res = await mock_await_result(
+        plugin.companion_edit_profile(
+            MockEvent(aff_umo, "陪伴 改画像 u-aff 备注=老朋友 好感=42")
+        )
+    )
+    check("改画像指令有回复", res is not None and "已更新画像" in res[1], str(res))
+    prof2 = await plugin.store.get_profile(aff_umo, "u-aff")
+    check("改画像后备注生效", (prof2 or {}).get("note") == "老朋友", str(prof2))
+    check(
+        "改画像后好感度生效",
+        abs(float((prof2 or {}).get("affection") or 0) - 42.0) < 0.01,
+        str((prof2 or {}).get("affection")),
+    )
+    check(
+        "手动改的好感度立刻读到",
+        abs(await plugin._affection_of(aff_umo, "u-aff") - 42.0) < 0.01,
+    )
+
+    # 23.3 手动改的昵称不会被后续互动覆盖
+    await plugin.store.update_profile_fields(aff_umo, "u-aff", nickname="宝哥")
+    await plugin.store.touch_profile(
+        aff_umo, "u-aff", nickname="平台昵称", event="user_message"
+    )
+    prof3 = await plugin.store.get_profile(aff_umo, "u-aff")
+    check("手动昵称不被覆盖", (prof3 or {}).get("nickname") == "宝哥", str(prof3))
+
+    # 23.4 历史聊天记录回填到画像
+    hist_umo = "aiocqhttp:FriendMessage:hist1"
+    for i in range(3):
+        await plugin.store.add_message(
+            hist_umo, "user", f"历史消息{i}", "老用户", "u-hist"
+        )
+    await plugin.store.add_message(hist_umo, "bot", "在的", "bot", "")
+    count = await plugin.store.backfill_profiles()
+    check("历史回填有产出", count >= 1, str(count))
+    hist_profile = await plugin.store.get_profile(hist_umo, "u-hist")
+    check("历史用户生成画像", hist_profile is not None)
+    check(
+        "画像包含历史消息数",
+        int((hist_profile or {}).get("msg_count") or 0) == 3,
+        str((hist_profile or {}).get("msg_count")),
+    )
+    check(
+        "画像包含历史机器人回应数",
+        int((hist_profile or {}).get("bot_replies") or 0) >= 1,
+        str((hist_profile or {}).get("bot_replies")),
+    )
+    check(
+        "历史用户也有好感度",
+        float((hist_profile or {}).get("affection") or 0) > 0,
+        str((hist_profile or {}).get("affection")),
+    )
+    hist_text = await plugin._render_profile(hist_profile or {})
+    check("画像展示历史聊天记录", "历史消息" in hist_text, hist_text[:300])
+
+    # 23.5 画像里能看到聊天足迹
+    await plugin.store.add_message(aff_umo, "user", "今天天气不错", "阿宝", "u-aff")
+    aff_text = await plugin._render_profile(
+        await plugin.store.get_profile(aff_umo, "u-aff") or {}
+    )
+    check("画像展示最近说过的话", "今天天气不错" in aff_text, aff_text[:400])
+
     shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n" + "=" * 52)

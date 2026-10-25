@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS user_profiles (
     first_seen    REAL NOT NULL DEFAULT 0,
     last_seen     REAL NOT NULL DEFAULT 0,
     affection_at  REAL NOT NULL DEFAULT 0,
+    nickname_manual INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_key, user_id)
 );
 """
@@ -147,6 +148,9 @@ class Store:
             },
             "messages": {
                 "sender_id": "TEXT DEFAULT ''",
+            },
+            "user_profiles": {
+                "nickname_manual": "INTEGER NOT NULL DEFAULT 0",
             },
         }
         for table, columns in additions.items():
@@ -488,8 +492,14 @@ class Store:
                 " tags, note, msg_count, bot_replies, first_seen, last_seen,"
                 " affection_at) VALUES (?, ?, ?, ?, '[]', '', ?, ?, ?, ?, ?)"
                 " ON CONFLICT(session_key, user_id) DO UPDATE SET"
-                " nickname = excluded.nickname, affection = excluded.affection,"
+                " nickname = CASE WHEN user_profiles.nickname_manual = 1"
+                " AND user_profiles.nickname <> '' THEN user_profiles.nickname"
+                " ELSE excluded.nickname END,"
+                " affection = excluded.affection,"
                 " msg_count = excluded.msg_count, bot_replies = excluded.bot_replies,"
+                " first_seen = CASE WHEN user_profiles.first_seen > 0"
+                " AND user_profiles.first_seen < excluded.first_seen"
+                " THEN user_profiles.first_seen ELSE excluded.first_seen END,"
                 " last_seen = excluded.last_seen, affection_at = excluded.affection_at",
                 (
                     session_key,
@@ -571,6 +581,8 @@ class Store:
             if nickname is not None:
                 sets.append("nickname = ?")
                 values.append(nickname)
+                # 标记为手动设置，后续互动不再用平台昵称覆盖
+                sets.append("nickname_manual = 1")
             if not sets:
                 row = conn.execute(
                     "SELECT * FROM user_profiles WHERE session_key = ? AND user_id = ?",
@@ -588,6 +600,118 @@ class Store:
                 (session_key, user_id),
             ).fetchone()
             return dict(row) if row else None
+
+        return await self._run(_do)
+
+    async def backfill_profiles(self) -> int:
+        """根据历史聊天记录回填人物画像。
+
+        插件升级前积累的聊天记录也应该体现在画像里（消息数、首末出现时间、
+        昵称等）。这里只做「补齐」：已有画像保留手动设置与已累积的好感度，
+        缺失的部分用历史记录补上；完全没见过的用户则新建画像。
+
+        返回新建 / 更新的画像条数。
+        """
+
+        def _do(conn: sqlite3.Connection) -> int:
+            bot_counts = {
+                str(row["session_key"]): int(row["c"])
+                for row in conn.execute(
+                    "SELECT session_key, COUNT(*) AS c FROM messages"
+                    " WHERE role = 'bot' GROUP BY session_key"
+                ).fetchall()
+            }
+            rows = conn.execute(
+                "SELECT session_key, sender_id, sender, COUNT(*) AS c,"
+                " MIN(ts) AS first_ts, MAX(ts) AS last_ts FROM messages"
+                " WHERE role = 'user' AND sender_id <> ''"
+                " GROUP BY session_key, sender_id"
+            ).fetchall()
+            changed = 0
+            for row in rows:
+                session_key = str(row["session_key"])
+                user_id = str(row["sender_id"])
+                count = int(row["c"] or 0)
+                first_ts = float(row["first_ts"] or 0.0)
+                last_ts = float(row["last_ts"] or 0.0)
+                sender = str(row["sender"] or "")
+                bot_count = bot_counts.get(session_key, 0)
+                existing = conn.execute(
+                    "SELECT * FROM user_profiles WHERE session_key = ? AND user_id = ?",
+                    (session_key, user_id),
+                ).fetchone()
+                if existing is None:
+                    score = affection_mod.clamp(
+                        count * affection_mod.DELTA_USER_MESSAGE
+                    )
+                    conn.execute(
+                        "INSERT INTO user_profiles (session_key, user_id, nickname,"
+                        " affection, tags, note, msg_count, bot_replies, first_seen,"
+                        " last_seen, affection_at, nickname_manual)"
+                        " VALUES (?, ?, ?, ?, '[]', '', ?, ?, ?, ?, ?, 0)",
+                        (
+                            session_key,
+                            user_id,
+                            sender,
+                            score,
+                            count,
+                            bot_count,
+                            first_ts,
+                            last_ts,
+                            last_ts,
+                        ),
+                    )
+                    changed += 1
+                    continue
+                # 已有画像：只补齐缺失的部分，不覆盖手动设置
+                nickname = str(existing["nickname"] or "")
+                manual = int(existing["nickname_manual"] or 0)
+                if not nickname or (not manual and sender and sender != nickname):
+                    nickname = sender
+                msg_count = max(int(existing["msg_count"] or 0), count)
+                bot_replies = max(int(existing["bot_replies"] or 0), bot_count)
+                first_seen = float(existing["first_seen"] or 0.0)
+                if first_seen <= 0 or (first_ts > 0 and first_ts < first_seen):
+                    first_seen = first_ts
+                last_seen = max(float(existing["last_seen"] or 0.0), last_ts)
+                score = float(existing["affection"] or 0.0)
+                if score <= 0 and count > 0:
+                    score = affection_mod.clamp(
+                        count * affection_mod.DELTA_USER_MESSAGE
+                    )
+                conn.execute(
+                    "UPDATE user_profiles SET nickname = ?, affection = ?,"
+                    " msg_count = ?, bot_replies = ?, first_seen = ?, last_seen = ?"
+                    " WHERE session_key = ? AND user_id = ?",
+                    (
+                        nickname,
+                        score,
+                        msg_count,
+                        bot_replies,
+                        first_seen,
+                        last_seen,
+                        session_key,
+                        user_id,
+                    ),
+                )
+                changed += 1
+            return changed
+
+        return await self._run(_do)
+
+    async def recent_user_messages(
+        self, session_key: str, user_id: str, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """取某个用户最近说过的话（用于画像展示聊天足迹）。"""
+
+        def _do(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                "SELECT role, sender, content, ts FROM messages"
+                " WHERE session_key = ? AND sender_id = ?"
+                " ORDER BY id DESC LIMIT ?",
+                (session_key, user_id, limit),
+            ).fetchall()
+            return [dict(r) for r in reversed(rows)]
 
         return await self._run(_do)
 
