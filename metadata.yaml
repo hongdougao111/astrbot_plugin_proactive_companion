@@ -23,6 +23,15 @@ desc: |
 
   **指令**：`/陪伴 开启`、`/陪伴 关闭`、`/陪伴 状态`、`/陪伴 说说`、`/陪伴 诊断`、`/陪伴 清空`
 
+  **v1.0.4 更新说明**
+
+  - **修复：保存插件配置报「错误的类型 proactive_reply_whitelist：期望是 list，得到了 str」**。
+    原因是可视化面板把「主动回复白名单」按字符串写回配置，而 schema 声明的是 list。
+    现在面板按 list 提交，保存接口也会按 schema 自动规整类型。
+  - **新增配置自愈**：插件加载时会自动把历史遗留的类型不符配置（例如字符串形式的 list）
+    修正并落盘，升级后无需手动清理。
+  - 修正打包脚本：交付 zip 不再包含 `.git`、`__pycache__` 等非发布内容。
+
   **v1.0.3 更新说明**
 
   - **新增「读空气」**：根据会话最近的发言算出气氛等级——冷清 / 正常 / 热闹 / 紧张，
@@ -43,7 +52,7 @@ desc: |
     **临时上下文**注入本次 LLM 请求（不写入会话历史）。
   - 白名单语义调整：留空 = 不限制；`proactive_reply_enabled` 默认开启，概率默认 0.2。
   - 新增 `/陪伴 诊断` 指令与面板「最近判定 / 跳过原因」，几秒内可定位为什么没触发。
-version: 1.0.3
+version: 1.0.4
 author: hongdougao111
 repo: https://github.com/hongdougao111/astrbot_plugin_proactive_companion
 social_link: https://github.com/hongdougao111
