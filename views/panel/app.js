@@ -16,7 +16,7 @@ const state = {
 const CONFIG_FIELDS = [
   { key: "enabled", label: "插件总开关", type: "bool" },
   { key: "check_interval_seconds", label: "检查间隔（秒）", type: "int", min: 15 },
-  { key: "quiet_hours", label: "免打扰时段", type: "text", hint: "如 23:00-07:30，多个用英文逗号分隔" },
+  { key: "quiet_hours", label: "免打扰时段", type: "text", list: true, hint: "如 23:00-07:30，多个用英文逗号分隔" },
   { key: "min_idle_minutes", label: "最小静默时长（分钟）", type: "int", min: 0 },
   { key: "cooldown_minutes", label: "两次主动消息间隔（分钟）", type: "int", min: 0 },
   { key: "max_daily_messages", label: "每日主动消息上限（0 不限）", type: "int", min: 0 },
@@ -37,7 +37,7 @@ const CONFIG_FIELDS = [
   { key: "keep_events", label: "保留事件日志条数", type: "int", min: 50 },
   { key: "proactive_reply_enabled", label: "启用主动回复", type: "bool" },
   { key: "proactive_reply_probability", label: "主动回复概率 (0.0-1.0)", type: "float", min: 0 },
-  { key: "proactive_reply_whitelist", label: "主动回复白名单", type: "text", hint: "用户 ID / 群号 / 会话 ID，逗号分隔；留空 = 不限制；* = 不限制" },
+  { key: "proactive_reply_whitelist", label: "主动回复白名单", type: "text", list: true, hint: "用户 ID / 群号 / 会话 ID，逗号分隔；留空 = 不限制；* = 不限制" },
   { key: "proactive_reply_cooldown_minutes", label: "主动回复冷却(分钟)", type: "int", min: 0 },
   { key: "proactive_reply_min_length", label: "最短触发消息长度", type: "int", min: 0 },
   { key: "capture_context_enabled", label: "采集对话上下文", type: "bool" },
@@ -259,7 +259,7 @@ async function loadConfig() {
       control = `<div class="switch"><input type="checkbox" id="${id}" data-key="${f.key}" data-type="bool" ${value ? "checked" : ""} /><span>${value ? "已开启" : "已关闭"}</span></div>`;
     } else if (f.type === "textarea") {
       control = `<textarea id="${id}" data-key="${f.key}" data-type="text">${esc(value ?? "")}</textarea>`;
-    } else if (f.type === "text" && f.key === "quiet_hours") {
+    } else if (f.list) {
       const arr = Array.isArray(value) ? value.join(", ") : value ?? "";
       control = `<input type="text" id="${id}" data-key="${f.key}" data-type="list" value="${esc(arr)}" />`;
     } else {

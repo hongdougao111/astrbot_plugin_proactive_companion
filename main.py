@@ -142,6 +142,7 @@ class ProactiveCompanionPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
         super().__init__(context)
         self.config = config if config is not None else AstrBotConfig()
+        self._normalize_config()
         self.data_dir: Path = StarTools.get_data_dir(PLUGIN_NAME)
         self.store = Store(self.data_dir / "proactive.db")
         self._task: asyncio.Task | None = None
@@ -162,6 +163,60 @@ class ProactiveCompanionPlugin(Star):
         global _PLUGIN_REF
         _PLUGIN_REF = self
         self._register_web_apis()
+
+    def _schema(self) -> dict[str, Any]:
+        """读取 _conf_schema.json，用于按类型规整配置值。"""
+        path = Path(__file__).resolve().parent / "_conf_schema.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:  # pragma: no cover
+            return {}
+
+    def _coerce_value(self, meta: Any, value: Any) -> Any:
+        """把值规整成 schema 声明的类型，避免框架校验报「错误的类型」。"""
+        if not isinstance(meta, dict):
+            return value
+        kind = meta.get("type")
+        if kind == "list" and isinstance(value, str):
+            parts = value.replace("，", ",").replace("\n", ",").split(",")
+            return [p.strip() for p in parts if p.strip()]
+        if kind == "float" and isinstance(value, int) and not isinstance(value, bool):
+            return float(value)
+        if kind == "int" and isinstance(value, str):
+            try:
+                return int(value.strip())
+            except (TypeError, ValueError):
+                return value
+        if kind == "bool" and isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return value
+
+    def _normalize_config(self) -> None:
+        """自愈：把历史遗留的类型不符的配置（例如字符串形式的 list）修正并落盘。
+
+        框架对插件配置做严格类型校验，一旦某个 list 字段被写成字符串，
+        用户在 WebUI 保存配置时就会报「错误的类型」。这里在插件加载时先修好。
+        """
+        schema = self._schema()
+        changed = False
+        for key, meta in schema.items():
+            if not isinstance(meta, dict) or "type" not in meta:
+                continue
+            if key not in self.config:
+                continue
+            old = self.config.get(key)
+            new = self._coerce_value(meta, old)
+            # 注意 1 == 1.0，所以类型不同也要当作需要修正
+            if new != old or type(new) is not type(old):
+                self.config[key] = new
+                changed = True
+        if changed:
+            try:
+                self.config.save_config()
+                logger.info("[主动陪伴] 已修正配置项类型（list 字段曾被写成字符串）。")
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f"[主动陪伴] 修正配置类型失败: {exc}")
 
     # ------------------------------------------------------------------
     # 配置辅助
@@ -1475,9 +1530,11 @@ class ProactiveCompanionPlugin(Star):
         if not isinstance(data, dict):
             data = {k: v for k, v in payload.items() if k in SAFE_DEFAULTS}
         updated = False
+        schema = self._schema()
         for key, value in data.items():
             if key not in SAFE_DEFAULTS:
                 continue
+            value = self._coerce_value(schema.get(key), value)
             if self.config.get(key) != value:
                 self.config[key] = value
                 updated = True
