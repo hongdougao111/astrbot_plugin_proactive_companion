@@ -625,7 +625,12 @@ class Store:
             if nickname is not None:
                 sets.append("nickname = ?")
                 values.append(nickname)
-                sets.append("nickname_manual = 1")
+                # 空昵称表示「恢复跟随平台昵称」
+                sets.append(
+                    "nickname_manual = 0"
+                    if not nickname.strip()
+                    else "nickname_manual = 1"
+                )
             if sets:
                 values.extend([key, uid])
                 conn.execute(
@@ -724,8 +729,13 @@ class Store:
             if nickname is not None:
                 sets.append("nickname = ?")
                 values.append(nickname)
-                # 标记为手动设置，后续互动不再用平台昵称覆盖
-                sets.append("nickname_manual = 1")
+                # 标记为手动设置，后续互动不再用平台昵称覆盖；
+                # 昵称留空则表示「恢复跟随平台昵称」
+                sets.append(
+                    "nickname_manual = 0"
+                    if not nickname.strip()
+                    else "nickname_manual = 1"
+                )
             if not sets:
                 row = conn.execute(
                     "SELECT * FROM user_profiles WHERE session_key = ? AND user_id = ?",
@@ -916,6 +926,36 @@ class Store:
                     (base_arousal, time.time()),
                 )
             return {"messages": messages, "profiles": profiles}
+
+        return await self._run(_do)
+
+    async def latest_sender_names(
+        self, session_key: str
+    ) -> tuple[dict[str, str], str, str]:
+        """返回 (每个用户 ID 的最新昵称, 最近发言者 ID, 最近发言者昵称)。
+
+        用户改了昵称之后，历史消息里存的还是旧名字；这里按「最新一次出现的
+        名字」给出映射，方便把上下文里的旧名字统一替换成新名字。
+        """
+        session_key = (session_key or "").strip()
+
+        def _do(conn: sqlite3.Connection) -> tuple[dict[str, str], str, str]:
+            rows = conn.execute(
+                "SELECT sender_id, sender FROM messages"
+                " WHERE session_key = ? AND role = 'user' AND sender_id <> ''"
+                " AND id IN (SELECT MAX(id) FROM messages WHERE session_key = ?"
+                " AND role = 'user' AND sender_id <> '' GROUP BY sender_id)",
+                (session_key, session_key),
+            ).fetchall()
+            names = {str(r["sender_id"]): str(r["sender"] or "") for r in rows}
+            peer = conn.execute(
+                "SELECT sender_id, sender FROM messages WHERE session_key = ?"
+                " AND role = 'user' AND sender_id <> '' ORDER BY id DESC LIMIT 1",
+                (session_key,),
+            ).fetchone()
+            peer_id = str(peer["sender_id"]) if peer else ""
+            peer_name = str(peer["sender"] or "") if peer else ""
+            return names, peer_id, peer_name
 
         return await self._run(_do)
 

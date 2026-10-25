@@ -1726,6 +1726,109 @@ async def main() -> None:
     check("非法 scope 报错", resp.status_code == 400, str(resp.status_code))
     prof_req.set_json({})
 
+    print("\n== 26. 昵称跟随与称呼规则 ==")
+    from core import emotion as emotion_mod  # type: ignore
+    from core import generator as gen  # type: ignore
+
+    # 改了昵称后，历史消息里的旧名字要被替换成新名字
+    nick_umo = "aiocqhttp:FriendMessage:nick1"
+    await plugin.store.add_message(nick_umo, "user", "在吗", "旧名字", "u-nick")
+    await plugin.store.add_message(nick_umo, "user", "还是我", "新名字", "u-nick")
+    names, peer_id, peer_name = await plugin.store.latest_sender_names(nick_umo)
+    check("能取到最新昵称", names.get("u-nick") == "新名字", str(names))
+    check(
+        "能取到最近发言者",
+        peer_id == "u-nick" and peer_name == "新名字",
+        f"{peer_id}/{peer_name}",
+    )
+
+    block = gen.build_context_block(
+        await plugin.store.recent_messages(nick_umo, 10), names=names
+    )
+    check("上下文里用新昵称", "新名字:" in block, block[:120])
+    check("上下文里不再出现旧昵称", "旧名字" not in block, block[:120])
+
+    # 主动消息的上下文也要带昵称
+    check(
+        "主动消息上下文带昵称",
+        "新名字: 还是我" in block,
+        block[:120],
+    )
+
+    # 提示词里要有称呼规则
+    prompt = gen.build_prompt(
+        block,
+        emotion_mod.EmotionState(),
+        30.0,
+        is_group=False,
+        peer_name="新名字",
+    )
+    check("提示词带昵称", "新名字" in prompt, prompt[:200])
+    check(
+        "提示词禁止泛称",
+        "亲爱的" in prompt and "不要用" in prompt,
+        prompt[:300],
+    )
+
+    # 主动回复注入的上下文也要带称呼规则
+    inject_block = plugin._format_context_block(
+        await plugin.store.recent_messages(nick_umo, 10),
+        "",
+        names,
+        "新名字",
+    )
+    check("注入上下文带称呼规则", "不要用" in inject_block, inject_block[-300:])
+
+    # 手动昵称优先；留空则恢复跟随平台昵称
+    await plugin.store.touch_profile(
+        nick_umo, "u-nick", nickname="平台昵称", event="user_message"
+    )
+    await plugin.store.update_profile_fields_by_user(
+        "u-nick", nick_umo, nickname="宝哥"
+    )
+    profile_nick = await plugin.store.get_profile(nick_umo, "u-nick")
+    check(
+        "手动昵称已保存",
+        (profile_nick or {}).get("nickname") == "宝哥",
+        str(profile_nick),
+    )
+    check(
+        "手动昵称标记已置位",
+        int((profile_nick or {}).get("nickname_manual") or 0) == 1,
+        str(profile_nick),
+    )
+    await plugin.store.touch_profile(
+        nick_umo, "u-nick", nickname="平台昵称2", event="user_message"
+    )
+    profile_nick = await plugin.store.get_profile(nick_umo, "u-nick")
+    check(
+        "手动昵称不被平台覆盖",
+        (profile_nick or {}).get("nickname") == "宝哥",
+        str(profile_nick),
+    )
+
+    # 手动昵称也会覆盖上下文里的名字
+    names2, _, peer2 = await plugin._nickname_context(nick_umo)
+    check("手动昵称优先于平台昵称", peer2 == "宝哥", f"{peer2}")
+
+    # 清空昵称 = 恢复跟随平台昵称
+    await plugin.store.update_profile_fields_by_user("u-nick", nick_umo, nickname="")
+    profile_nick = await plugin.store.get_profile(nick_umo, "u-nick")
+    check(
+        "清空昵称后取消手动标记",
+        int((profile_nick or {}).get("nickname_manual") or 0) == 0,
+        str(profile_nick),
+    )
+    await plugin.store.touch_profile(
+        nick_umo, "u-nick", nickname="平台昵称3", event="user_message"
+    )
+    profile_nick = await plugin.store.get_profile(nick_umo, "u-nick")
+    check(
+        "恢复后跟随平台昵称",
+        (profile_nick or {}).get("nickname") == "平台昵称3",
+        str(profile_nick),
+    )
+
     shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n" + "=" * 52)

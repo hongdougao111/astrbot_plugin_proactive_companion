@@ -281,8 +281,9 @@ async function loadProfiles() {
       p.session_key
     )}" data-user="${esc(p.user_id)}">
           <div class="profile-head">
-            <div class="profile-name">${esc(p.nickname || "（未设置昵称）")}
-              <span class="muted">${esc(p.user_id)}</span></div>
+            <div class="profile-name">${esc(p.nickname || "（跟随平台昵称）")}
+              <span class="muted">${esc(p.user_id)}</span>
+              ${p.nickname_manual ? '<span class="muted">· 手动设置</span>' : ""}</div>
             <span class="badge ${p.affection >= 30 ? "good" : ""}" title="${esc(
           p.level
         )}">${esc(p.level)} ${p.affection.toFixed(1)} <span class="muted">${bar}</span></span>

@@ -413,31 +413,72 @@ class ProactiveCompanionPlugin(Star):
                 hint = f"{hint}\n{rel}".strip()
             if not messages and not hint:
                 return
-            text = self._format_context_block(messages, hint)
+            names, _, peer_name = await self._nickname_context(umo)
+            text = self._format_context_block(messages, hint, names, peer_name)
             if not text:
                 return
             req.extra_user_content_parts.append(TextPart(text=text).mark_as_temp())
         except Exception as exc:  # pragma: no cover
             logger.warning(f"[主动陪伴] 注入上下文失败: {exc}")
 
+    async def _nickname_context(
+        self, session_key: str
+    ) -> tuple[dict[str, str], str, str]:
+        """返回 (用户 ID -> 最新昵称, 主对话对象 ID, 主对话对象昵称)。
+
+        昵称优先级：**手动设置的昵称** > 消息记录里该用户最新出现的名字。
+        这样用户改了昵称之后，历史消息里的旧名字也会被替换成新名字，
+        模型不会把新旧两个名字当成两个人，也不会继续用旧称呼。
+        """
+        names: dict[str, str] = {}
+        peer_id = ""
+        peer_name = ""
+        try:
+            names, peer_id, peer_name = await self.store.latest_sender_names(
+                session_key
+            )
+        except Exception:  # pragma: no cover
+            pass
+        try:
+            profiles = await self.store.list_profiles(session_key)
+        except Exception:  # pragma: no cover
+            profiles = []
+        for row in profiles:
+            uid = str(row.get("user_id") or "")
+            nick = str(row.get("nickname") or "").strip()
+            if uid and nick and int(row.get("nickname_manual") or 0):
+                names[uid] = nick
+        if peer_id and names.get(peer_id):
+            peer_name = names[peer_id]
+        return names, peer_id, peer_name
+
     def _format_context_block(
-        self, messages: list[dict[str, Any]], atmosphere_hint: str = ""
+        self,
+        messages: list[dict[str, Any]],
+        atmosphere_hint: str = "",
+        names: dict[str, str] | None = None,
+        peer_name: str = "",
     ) -> str:
         """把记录的消息格式化成给 LLM 的上下文块。
 
-        同名用户会被标注用户 ID 片段，避免模型把不同的人当成同一个人。
+        同名用户会被标注用户 ID 片段，避免模型把不同的人当成同一个人；
+        改过昵称的用户会统一使用最新昵称，避免新旧两个名字混在一起。
         """
         # 统计「昵称 -> 用户 ID」的映射，判断哪些昵称存在重名
         name_to_ids: dict[str, set[str]] = {}
         for msg in messages:
             name = str(msg.get("sender") or "").strip()
             sid = str(msg.get("sender_id") or "").strip()
+            if names and sid and names.get(sid):
+                name = names[sid]
             if name and sid:
                 name_to_ids.setdefault(name, set()).add(sid)
 
         def _label(msg: dict[str, Any]) -> str:
-            name = str(msg.get("sender") or "").strip()
             sid = str(msg.get("sender_id") or "").strip()
+            name = str(msg.get("sender") or "").strip()
+            if names and sid and names.get(sid):
+                name = names[sid]
             if not name:
                 return sid or "对方"
             if sid and len(name_to_ids.get(name, set())) > 1:
@@ -463,6 +504,12 @@ class ProactiveCompanionPlugin(Star):
             return atmosphere_hint
         body = "\n".join(lines)
         hint_block = f"{atmosphere_hint}\n" if atmosphere_hint else ""
+        naming_rule = ""
+        if peer_name:
+            naming_rule = (
+                f"对话对象的昵称是「{peer_name}」，请用这个昵称称呼对方，"
+                "不要用「亲爱的」「宝贝」这类泛称，也不要编造别的称呼。\n"
+            )
         return (
             "<chat_context>\n"
             "以下是当前会话最近的对话记录，请据此理解上下文，"
@@ -474,6 +521,7 @@ class ProactiveCompanionPlugin(Star):
             "你现在是主动参与这段对话（对方并没有点名你），"
             "请像真人一样自然地接话，回复要简短，不要显得突兀或莫名其妙。"
             "也要顾及当前群里的气氛，别抢话、别在气氛紧张时插嘴。\n"
+            f"{naming_rule}"
             "</reply_hint>"
         )
 
@@ -1187,10 +1235,12 @@ class ProactiveCompanionPlugin(Star):
             session_key, self._cfg_int("max_context_messages", 12) + 8
         )
         history = await self._astro_history(umo)
+        names, _, peer_name = await self._nickname_context(session_key)
         context_block = generator.build_context_block(
             recent,
             history,
             max_items=self._cfg_int("max_context_messages", 12),
+            names=names,
         )
         prompt = generator.build_prompt(
             context_block,
@@ -1198,6 +1248,7 @@ class ProactiveCompanionPlugin(Star):
             idle_minutes,
             is_group=chat_type == "group",
             group_title=str(session.get("title") or ""),
+            peer_name=peer_name,
         )
         hint = self._atmosphere_hint(umo)
         if hint:
@@ -2113,6 +2164,7 @@ class ProactiveCompanionPlugin(Star):
                     "last_seen": row_last,
                     "session_count": 1,
                     "sessions": [row_session],
+                    "nickname_manual": int(row.get("nickname_manual") or 0),
                 }
                 continue
             # 同一个人：合并各项统计，昵称/备注取最近活跃的那份
@@ -2130,6 +2182,7 @@ class ProactiveCompanionPlugin(Star):
                 item["session_key"] = row_session
                 item["affection"] = float(row.get("affection") or 0.0)
                 item["nickname"] = row.get("nickname") or item["nickname"]
+                item["nickname_manual"] = int(row.get("nickname_manual") or 0)
             if not item["tags"] and tags:
                 item["tags"] = tags
             if not item["note"] and row.get("note"):

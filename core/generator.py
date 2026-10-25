@@ -68,8 +68,13 @@ def build_context_block(
     recent_messages: list[dict[str, Any]],
     astro_history: list[str] | None = None,
     max_items: int = 12,
+    names: dict[str, str] | None = None,
 ) -> str:
-    """把插件记录的近期消息与 AstrBot 会话历史拼成上下文文本。"""
+    """把插件记录的近期消息与 AstrBot 会话历史拼成上下文文本。
+
+    names 是「用户 ID -> 最新昵称」的映射，用来把历史消息里的旧昵称统一替换
+    成用户现在的昵称（改过昵称后上下文里就不会同时出现新旧两个名字）。
+    """
     lines: list[str] = []
     for item in astro_history or []:
         if isinstance(item, str) and item.strip():
@@ -80,8 +85,11 @@ def build_context_block(
         if not content:
             continue
         sender = str(msg.get("sender", "") or "").strip()
+        sender_id = str(msg.get("sender_id", "") or "").strip()
+        if names and sender_id and names.get(sender_id):
+            sender = names[sender_id]
         if role == "user":
-            lines.append(f"用户: {content}")
+            lines.append(f"{sender or '用户'}: {content}")
         elif role == "bot":
             lines.append(f"我: {content}")
         elif role == "proactive":
@@ -99,6 +107,7 @@ def build_prompt(
     idle_minutes: float,
     is_group: bool,
     group_title: str = "",
+    peer_name: str = "",
 ) -> str:
     """构造发给 LLM 的提示词。"""
     now_str = time.strftime("%Y-%m-%d %H:%M")
@@ -110,6 +119,11 @@ def build_prompt(
         "你可以主动开启一个新话题。"
     )
     parts.append(f"你现在的情绪是「{label_for(mood)}」。{tone_hint(mood)}")
+    if peer_name:
+        parts.append(
+            f"你正在和「{peer_name}」说话。请用「{peer_name}」称呼对方，"
+            "不要用「亲爱的」「宝贝」「小朋友」这类泛称，也不要编造别的称呼。"
+        )
     if is_group:
         parts.append(
             "这是群聊场景，请注意分寸，不要刷屏，内容要简短自然，"
