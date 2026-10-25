@@ -1,0 +1,372 @@
+// 主动陪伴 · 可视化面板
+// 通过 window.AstrBotPluginView bridge 与插件后端通信。
+
+const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
+
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+const state = {
+  config: {},
+  sessions: [],
+  events: [],
+  currentSession: null,
+};
+
+const CONFIG_FIELDS = [
+  { key: "enabled", label: "插件总开关", type: "bool" },
+  { key: "check_interval_seconds", label: "检查间隔（秒）", type: "int", min: 15 },
+  { key: "quiet_hours", label: "免打扰时段", type: "text", hint: "如 23:00-07:30，多个用英文逗号分隔" },
+  { key: "min_idle_minutes", label: "最小静默时长（分钟）", type: "int", min: 0 },
+  { key: "cooldown_minutes", label: "两次主动消息间隔（分钟）", type: "int", min: 0 },
+  { key: "max_daily_messages", label: "每日主动消息上限（0 不限）", type: "int", min: 0 },
+  { key: "max_proactive_per_tick", label: "单轮最多发送数", type: "int", min: 1 },
+  { key: "idle_jitter_ratio", label: "静默阈值抖动比例", type: "float", min: 0 },
+  { key: "group_enabled", label: "允许群聊主动发言", type: "bool" },
+  { key: "private_enabled", label: "允许私聊主动发言", type: "bool" },
+  { key: "mention_only_in_group", label: "群聊仅被 @ 后发言", type: "bool" },
+  { key: "mood_enabled", label: "启用动态情绪", type: "bool" },
+  { key: "mood_decay_per_hour", label: "情绪衰减速度 / 小时", type: "float", min: 0 },
+  { key: "mood_affect_frequency", label: "情绪影响发言频率", type: "bool" },
+  { key: "tts_enabled", label: "启用 TTS 语音", type: "bool" },
+  { key: "tts_provider_id", label: "TTS 提供商 ID", type: "text", hint: "留空则使用会话默认的 TTS 提供商" },
+  { key: "tts_send_text", label: "语音同时发送文本", type: "bool" },
+  { key: "tts_max_chars", label: "TTS 文本长度上限", type: "int", min: 0 },
+  { key: "max_context_messages", label: "上下文消息条数", type: "int", min: 1 },
+  { key: "keep_messages_per_session", label: "每会话保留消息数", type: "int", min: 10 },
+  { key: "keep_events", label: "保留事件日志条数", type: "int", min: 50 },
+  { key: "system_prompt", label: "人设提示词", type: "textarea" },
+];
+
+function toast(message, isError = false) {
+  const el = $("#toast");
+  if (!el) return;
+  el.textContent = message;
+  el.hidden = false;
+  el.style.background = isError ? "var(--bad)" : "var(--text)";
+  el.style.color = isError ? "#fff" : "var(--panel)";
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => {
+    el.hidden = true;
+  }, 2600);
+}
+
+function fmtTime(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function esc(str) {
+  return String(str ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[c]);
+}
+
+// ---------------------------------------------------------------- 概览
+async function loadState() {
+  const data = await bridge.apiGet("state");
+  state.overview = data;
+
+  const cards = [
+    { num: data.sessions, label: "会话总数" },
+    { num: data.active_sessions, label: "已开启会话" },
+    { num: data.sent_today, label: "今日已发送" },
+    { num: data.in_quiet_hours ? "免打扰" : "可打扰", label: "时段状态" },
+  ];
+  $("#stat-cards").innerHTML = cards
+    .map((c) => `<div class="card stat"><div class="num">${esc(c.num)}</div><div class="label">${esc(c.label)}</div></div>`)
+    .join("");
+
+  const detail = [
+    ["插件状态", data.enabled ? "运行中" : "已停用"],
+    ["调度器", data.running ? "在线" : "未启动"],
+    ["检查间隔", `${data.interval} 秒`],
+    ["免打扰时段", (data.quiet_hours || []).join("、") || "未设置"],
+    ["下一次可打扰", data.next_available || "现在"],
+    ["情绪标签", data.mood_label],
+    ["TTS", data.tts_enabled ? "已启用" : "未启用"],
+    ["上次检查", fmtTime(data.last_tick_at)],
+    ["最近错误", data.last_tick_error || "无"],
+    ["数据目录", data.data_dir || ""],
+  ];
+  $("#state-detail").innerHTML = detail
+    .map(([k, v]) => `<div class="row"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`)
+    .join("");
+
+  const valence = Math.max(0, Math.min(1, (Number(data.avg_valence) + 1) / 2));
+  const arousal = Math.max(0, Math.min(1, Number(data.avg_arousal)));
+  $("#mood-valence").style.width = `${(valence * 100).toFixed(1)}%`;
+  $("#mood-arousal").style.width = `${(arousal * 100).toFixed(1)}%`;
+  $("#mood-label").textContent = data.mood_label || "平静";
+
+  const dot = $("#run-dot");
+  dot.className = `dot ${data.enabled && data.running ? "on" : "off"}`;
+  $("#subtitle").textContent = `${data.sessions} 个会话 · 今日 ${data.sent_today} 条 · ${data.in_quiet_hours ? "免打扰时段内" : "可自由发言"}`;
+}
+
+// ---------------------------------------------------------------- 会话
+async function loadSessions() {
+  const q = ($("#session-search")?.value || "").trim();
+  const data = await bridge.apiGet("sessions", q ? { q } : undefined);
+  state.sessions = data.sessions || [];
+  $("#session-count").textContent = `共 ${data.total ?? state.sessions.length} 个会话`;
+
+  const rows = state.sessions
+    .map((s) => {
+      const chat = s.chat_type === "group" ? "群聊" : "私聊";
+      const moodClass = s.valence >= 0.15 ? "good" : s.valence <= -0.15 ? "bad" : "";
+      return `<tr data-key="${esc(s.session_key)}">
+        <td class="name" title="${esc(s.title || s.session_key)}">${esc(s.title || s.session_key)}</td>
+        <td>${esc(chat)}${s.mentioned ? " <span class=\"badge\">@过我</span>" : ""}</td>
+        <td><span class="badge ${moodClass}">${esc(s.mood_label)}</span></td>
+        <td>${esc(s.messages_sent)}</td>
+        <td>${esc(s.daily_count)}</td>
+        <td><span class="badge ${s.enabled ? "good" : "bad"}">${s.enabled ? "开启" : "关闭"}</span></td>
+        <td>
+          <div class="row-actions">
+            <button class="btn tiny ghost" data-act="toggle">${s.enabled ? "关闭" : "开启"}</button>
+            <button class="btn tiny ghost" data-act="send">立即发送</button>
+            <button class="btn tiny ghost" data-act="mood">重置情绪</button>
+            <button class="btn tiny ghost" data-act="messages">记录</button>
+            <button class="btn tiny ghost danger" data-act="delete">删除</button>
+          </div>
+        </td>
+      </tr>`;
+    })
+    .join("");
+  $("#session-rows").innerHTML = rows || `<tr><td colspan="7" class="muted">暂无会话记录</td></tr>`;
+}
+
+async function sessionAction(key, act, btn) {
+  const original = btn.textContent;
+  btn.disabled = true;
+  try {
+    if (act === "toggle") {
+      await bridge.apiPost("sessions/toggle", { session_key: key });
+      toast("已更新会话状态");
+    } else if (act === "send") {
+      const r = await bridge.apiPost("sessions/send", { session_key: key });
+      toast(r.sent ? `已发送：${(r.text || "").slice(0, 30)}` : "发送失败或无内容", !r.sent);
+    } else if (act === "mood") {
+      await bridge.apiPost("sessions/reset_mood", { session_key: key });
+      toast("情绪已重置");
+    } else if (act === "messages") {
+      await loadMessages(key);
+      return;
+    } else if (act === "delete") {
+      await bridge.apiPost("sessions/delete", { session_key: key });
+      toast("会话数据已删除");
+    }
+    await Promise.all([loadSessions(), loadState()]);
+  } catch (err) {
+    toast(err.message || "操作失败", true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
+async function loadMessages(key) {
+  const data = await bridge.apiGet("sessions/messages", { session_key: key, limit: 80 });
+  state.currentSession = key;
+  $("#message-card").hidden = false;
+  const items = (data.messages || [])
+    .map(
+      (m) => `<div class="msg ${esc(m.role)}">
+        <div class="meta">${esc(m.role)} · ${esc(m.sender || "")} · ${fmtTime(m.ts)}</div>
+        <div>${esc(m.content)}</div>
+      </div>`
+    )
+    .join("");
+  $("#message-list").innerHTML = items || `<div class="muted">暂无消息</div>`;
+  $("#message-list").scrollTop = $("#message-list").scrollHeight;
+}
+
+// ---------------------------------------------------------------- 配置
+async function loadConfig() {
+  const data = await bridge.apiGet("config");
+  state.config = data.config || {};
+  const form = $("#config-form");
+  form.innerHTML = CONFIG_FIELDS.map((f) => {
+    const value = state.config[f.key];
+    const id = `cfg-${f.key}`;
+    let control;
+    if (f.type === "bool") {
+      control = `<div class="switch"><input type="checkbox" id="${id}" data-key="${f.key}" data-type="bool" ${value ? "checked" : ""} /><span>${value ? "已开启" : "已关闭"}</span></div>`;
+    } else if (f.type === "textarea") {
+      control = `<textarea id="${id}" data-key="${f.key}" data-type="text">${esc(value ?? "")}</textarea>`;
+    } else if (f.type === "text" && f.key === "quiet_hours") {
+      const arr = Array.isArray(value) ? value.join(", ") : value ?? "";
+      control = `<input type="text" id="${id}" data-key="${f.key}" data-type="list" value="${esc(arr)}" />`;
+    } else {
+      control = `<input type="${f.type === "int" || f.type === "float" ? "number" : "text"}" id="${id}" data-key="${f.key}" data-type="${f.type}" ${f.min !== undefined ? `min="${f.min}"` : ""} value="${esc(value ?? "")}" />`;
+    }
+    return `<div class="field">
+      <label for="${id}">${esc(f.label)}</label>
+      ${control}
+      ${f.hint ? `<div class="hint">${esc(f.hint)}</div>` : ""}
+    </div>`;
+  }).join("");
+
+  form.querySelectorAll('input[type="checkbox"]').forEach((input) => {
+    input.addEventListener("change", () => {
+      const span = input.parentElement.querySelector("span");
+      if (span) span.textContent = input.checked ? "已开启" : "已关闭";
+    });
+  });
+}
+
+function collectConfig() {
+  const out = {};
+  $$("#config-form [data-key]").forEach((el) => {
+    const key = el.dataset.key;
+    const type = el.dataset.type;
+    if (type === "bool") {
+      out[key] = !!el.checked;
+    } else if (type === "int") {
+      out[key] = parseInt(el.value || "0", 10) || 0;
+    } else if (type === "float") {
+      out[key] = parseFloat(el.value || "0") || 0;
+    } else if (type === "list") {
+      out[key] = String(el.value || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    } else {
+      out[key] = el.value ?? "";
+    }
+  });
+  return out;
+}
+
+async function saveConfig() {
+  const btn = $("#btn-save-config");
+  btn.disabled = true;
+  try {
+    const payload = collectConfig();
+    await bridge.apiPost("config/save", { config: payload });
+    $("#config-tip").textContent = `已保存 ${new Date().toLocaleTimeString()}`;
+    toast("配置已保存");
+    await loadState();
+  } catch (err) {
+    toast(err.message || "保存失败", true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------- 日志
+async function loadEvents() {
+  const data = await bridge.apiGet("events", { limit: 200 });
+  state.events = data.events || [];
+  $("#log-count").textContent = `最近 ${state.events.length} 条事件`;
+  $("#log-list").innerHTML = state.events
+    .map(
+      (e) => `<div class="log-item">
+        <span class="time">${fmtTime(e.ts)}</span>
+        <span class="kind">${esc(e.kind)}</span>
+        <span class="payload">${esc(e.payload || "")}</span>
+      </div>`
+    )
+    .join("") || `<div class="log-item"><span class="muted">暂无事件</span></div>`;
+}
+
+// ---------------------------------------------------------------- 初始化
+function bindTabs() {
+  $$("#tabs .tab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      $$("#tabs .tab").forEach((t) => t.classList.remove("active"));
+      $$(".panel").forEach((p) => p.classList.remove("active"));
+      tab.classList.add("active");
+      const panel = $(`#tab-${tab.dataset.tab}`);
+      if (panel) panel.classList.add("active");
+      if (tab.dataset.tab === "sessions") loadSessions().catch((e) => toast(e.message, true));
+      if (tab.dataset.tab === "config") loadConfig().catch((e) => toast(e.message, true));
+      if (tab.dataset.tab === "logs") loadEvents().catch((e) => toast(e.message, true));
+    });
+  });
+}
+
+function bindActions() {
+  $("#btn-refresh").addEventListener("click", async () => {
+    try {
+      await Promise.all([loadState(), loadSessions(), loadEvents()]);
+      toast("已刷新");
+    } catch (err) {
+      toast(err.message || "刷新失败", true);
+    }
+  });
+
+  $("#btn-tick").addEventListener("click", async () => {
+    toast("调度器将在下一个周期自动检查");
+  });
+
+  $("#btn-save-config").addEventListener("click", saveConfig);
+
+  $("#btn-close-msgs").addEventListener("click", () => {
+    $("#message-card").hidden = true;
+    state.currentSession = null;
+  });
+
+  $("#btn-export").addEventListener("click", async () => {
+    try {
+      await bridge.download("export", {}, "proactive-companion-export.json");
+      toast("已导出");
+    } catch (err) {
+      toast(err.message || "导出失败", true);
+    }
+  });
+
+  $("#session-search").addEventListener("input", () => {
+    clearTimeout(loadSessions._t);
+    loadSessions._t = setTimeout(() => {
+      loadSessions().catch((e) => toast(e.message, true));
+    }, 260);
+  });
+
+  $("#session-rows").addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button[data-act]");
+    if (!btn) return;
+    const tr = btn.closest("tr");
+    const key = tr?.dataset.key;
+    if (key) sessionAction(key, btn.dataset.act, btn);
+  });
+}
+
+async function main() {
+  if (!bridge) {
+    document.body.innerHTML = '<p style="padding:24px">未检测到 AstrBot 视图桥接 SDK，请在 AstrBot WebUI 中打开本插件视图。</p>';
+    return;
+  }
+  try {
+    const ctx = await bridge.ready();
+    const title = bridge.t ? bridge.t("views.panel.title", "主动陪伴") : "主动陪伴";
+    document.title = title;
+    const heading = $("#title");
+    if (heading) heading.textContent = title;
+  } catch (err) {
+    console.warn("bridge context unavailable", err);
+  }
+
+  bindTabs();
+  bindActions();
+
+  try {
+    await Promise.all([loadState(), loadSessions(), loadEvents()]);
+  } catch (err) {
+    toast(err.message || "加载失败", true);
+  }
+
+  // 定期刷新概览
+  setInterval(() => {
+    loadState().catch(() => {});
+  }, 30000);
+}
+
+main();

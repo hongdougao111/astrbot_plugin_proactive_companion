@@ -1,0 +1,135 @@
+{
+  "enabled": {
+    "description": "插件总开关",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后插件不再产生任何主动消息，仅保留数据与 WebUI。"
+  },
+  "check_interval_seconds": {
+    "description": "主动消息检查间隔（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "每隔多少秒检查一次是否有需要主动发言的会话，最小 15 秒。"
+  },
+  "quiet_hours": {
+    "description": "免打扰时段",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "格式如 23:00-07:30，多个时段用英文逗号分隔。跨越午夜会自动处理，期间不会主动发言。"
+  },
+  "min_idle_minutes": {
+    "description": "最小静默时长（分钟）",
+    "type": "int",
+    "default": 45,
+    "hint": "对方至少安静这么久，Bot 才会考虑主动开口。"
+  },
+  "cooldown_minutes": {
+    "description": "两次主动消息最小间隔（分钟）",
+    "type": "int",
+    "default": 180,
+    "hint": "防止刷屏，同一会话两次主动发言之间的最小间隔。"
+  },
+  "max_daily_messages": {
+    "description": "每会话每日主动消息上限",
+    "type": "int",
+    "default": 6,
+    "hint": "设为 0 表示不限制。"
+  },
+  "max_proactive_per_tick": {
+    "description": "单轮检查最多发出的主动消息数",
+    "type": "int",
+    "default": 3,
+    "hint": "避免一次性触发大量 LLM 请求，也避免多个会话同时被骚扰。"
+  },
+  "idle_jitter_ratio": {
+    "description": "静默阈值随机抖动比例",
+    "type": "float",
+    "default": 0.2,
+    "hint": "0 表示不抖动；0.2 表示实际阈值会在配置值的 80%~120% 之间随机。"
+  },
+  "group_enabled": {
+    "description": "允许在群聊中主动发言",
+    "type": "bool",
+    "default": true
+  },
+  "private_enabled": {
+    "description": "允许在私聊中主动发言",
+    "type": "bool",
+    "default": true
+  },
+  "mention_only_in_group": {
+    "description": "群聊中仅在被 @ 后才主动发言",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后 Bot 在群里会安静很多，只有你 @ 过它才会回复。"
+  },
+  "mood_enabled": {
+    "description": "启用动态情绪",
+    "type": "bool",
+    "default": true,
+    "hint": "情绪会影响主动消息的语气与触发频率。"
+  },
+  "mood_decay_per_hour": {
+    "description": "情绪衰减速度（每小时）",
+    "type": "float",
+    "default": 0.15,
+    "hint": "数值越大情绪越快回归平静。"
+  },
+  "mood_affect_frequency": {
+    "description": "情绪影响主动发言频率",
+    "type": "bool",
+    "default": true,
+    "hint": "心情好时更活跃，心情低落时会收敛。"
+  },
+  "tts_enabled": {
+    "description": "启用 TTS 语音主动消息",
+    "type": "bool",
+    "default": false,
+    "hint": "需要先在 WebUI 的提供商设置里配置好 TTS 提供商。"
+  },
+  "tts_provider_id": {
+    "description": "TTS 提供商",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider_tts",
+    "hint": "留空则使用当前会话偏好的 TTS 提供商。"
+  },
+  "tts_send_text": {
+    "description": "发送语音时同时发送文本",
+    "type": "bool",
+    "default": true
+  },
+  "tts_max_chars": {
+    "description": "TTS 文本长度上限",
+    "type": "int",
+    "default": 120,
+    "hint": "超过该长度的内容会被截断后再合成语音。"
+  },
+  "system_prompt": {
+    "description": "主动消息人设提示词",
+    "type": "text",
+    "default": "你是一个有性格的 AI 伙伴。你会主动给用户发消息，就像真人发微信一样自然。请用中文回复，语气口语化、简短（一般 1-3 句，不要长篇大论），不要使用 Markdown 语法，不要输出括号里的动作描写，也不要以'作为AI'开头。",
+    "editor_mode": true,
+    "editor_language": "markdown"
+  },
+  "max_context_messages": {
+    "description": "上下文消息条数",
+    "type": "int",
+    "default": 12,
+    "hint": "生成主动消息时参考的最近消息条数。"
+  },
+  "keep_messages_per_session": {
+    "description": "每会话保留的消息条数",
+    "type": "int",
+    "default": 200,
+    "hint": "超出后自动清理旧消息，避免数据库膨胀。"
+  },
+  "keep_events": {
+    "description": "保留的事件日志条数",
+    "type": "int",
+    "default": 1000
+  }
+}

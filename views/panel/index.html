@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>主动陪伴</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot" id="run-dot"></span>
+        <div>
+          <h1 id="title">主动陪伴</h1>
+          <p class="sub" id="subtitle">加载中…</p>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn ghost" id="btn-refresh">刷新</button>
+        <button class="btn primary" id="btn-tick">立即检查</button>
+      </div>
+    </header>
+
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="overview">概览</button>
+      <button class="tab" data-tab="sessions">会话</button>
+      <button class="tab" data-tab="config">配置</button>
+      <button class="tab" data-tab="logs">日志</button>
+    </nav>
+
+    <main>
+      <!-- 概览 -->
+      <section class="panel active" id="tab-overview">
+        <div class="cards" id="stat-cards"></div>
+        <div class="card block">
+          <h2>当前状态</h2>
+          <div class="kv" id="state-detail"></div>
+        </div>
+        <div class="card block">
+          <h2>情绪概览</h2>
+          <div class="mood-wrap">
+            <div class="mood-axis">
+              <div class="mood-bar"><div class="mood-fill" id="mood-valence"></div></div>
+              <span class="axis-label">愉悦度</span>
+            </div>
+            <div class="mood-axis">
+              <div class="mood-bar"><div class="mood-fill arousal" id="mood-arousal"></div></div>
+              <span class="axis-label">唤醒度</span>
+            </div>
+            <div class="mood-badge" id="mood-label">平静</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 会话 -->
+      <section class="panel" id="tab-sessions">
+        <div class="toolbar">
+          <input id="session-search" type="search" placeholder="搜索会话…" />
+          <span class="muted" id="session-count"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>会话</th>
+                <th>类型</th>
+                <th>情绪</th>
+                <th>已发送</th>
+                <th>今日</th>
+                <th>状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="session-rows"></tbody>
+          </table>
+        </div>
+        <div class="card block" id="message-card" hidden>
+          <h2>消息记录 <button class="btn tiny ghost" id="btn-close-msgs">关闭</button></h2>
+          <div class="messages" id="message-list"></div>
+        </div>
+      </section>
+
+      <!-- 配置 -->
+      <section class="panel" id="tab-config">
+        <div class="card block">
+          <h2>运行参数</h2>
+          <div class="form-grid" id="config-form"></div>
+          <div class="form-actions">
+            <button class="btn primary" id="btn-save-config">保存配置</button>
+            <span class="muted" id="config-tip"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 日志 -->
+      <section class="panel" id="tab-logs">
+        <div class="toolbar">
+          <button class="btn ghost" id="btn-export">导出数据</button>
+          <span class="muted" id="log-count"></span>
+        </div>
+        <div class="logs" id="log-list"></div>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" hidden></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

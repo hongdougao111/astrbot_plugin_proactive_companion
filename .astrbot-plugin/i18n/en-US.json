@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "Proactive Companion"
+  },
+  "views": {
+    "panel": {
+      "title": "Proactive Companion",
+      "description": "Manage proactive-message sessions, mood, quiet hours and runtime options."
+    }
+  }
+}
