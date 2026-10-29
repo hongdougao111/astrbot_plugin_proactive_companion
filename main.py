@@ -2659,6 +2659,10 @@ class ProactiveCompanionPlugin(Star):
                     "capture_context_enabled", True
                 ),
                 "captured_sessions": len(self._tracked_sessions),
+                "keep_messages_per_session": self._cfg_int(
+                    "keep_messages_per_session", 200
+                ),
+                "keep_messages_days": self._cfg_int("keep_messages_days", 30),
                 "atmosphere_enabled": self._cfg_bool("atmosphere_enabled", True),
                 "atmosphere_levels": self._atmosphere_levels(),
                 "data_dir": str(self.data_dir),

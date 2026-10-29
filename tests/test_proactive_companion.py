@@ -2296,6 +2296,21 @@ async def main() -> None:
         str(diag),
     )
 
+    # 29.6 面板概览里能看到保存设置
+    state_resp = await plugin.api_state()
+    state = state_resp.payload
+    check(
+        "概览接口带聊天记录保存设置",
+        state.get("keep_messages_per_session") == 120
+        and state.get("keep_messages_days") == 15,
+        str(
+            {
+                "keep_messages_per_session": state.get("keep_messages_per_session"),
+                "keep_messages_days": state.get("keep_messages_days"),
+            }
+        ),
+    )
+
     plugin.config["keep_messages_per_session"] = 200
     plugin.config["keep_messages_days"] = 30
 

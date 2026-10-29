@@ -161,6 +161,14 @@ async function loadState() {
       } 个会话）`,
     ],
     [
+      "聊天记录保存",
+      `每会话 ≤${data.keep_messages_per_session ?? 200} 条 / ${
+        (data.keep_messages_days ?? 0) > 0
+          ? `${data.keep_messages_days} 天`
+          : "不按时间清理"
+      }`,
+    ],
+    [
       "读空气",
       `${data.atmosphere_enabled ? "开" : "关"}（${
         Object.entries(data.atmosphere_levels || {})
