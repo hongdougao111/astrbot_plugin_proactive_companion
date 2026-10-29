@@ -306,6 +306,12 @@
     },
     "hint": "命中其中任意关键词的消息，整条都不会被注入给模型。用于规避群里那些会被 LLM 网关判为敏感的内容。留空 = 不屏蔽任何词。"
   },
+  "dedupe_llm_context_enabled": {
+    "description": "去除会话历史中的重复消息",
+    "type": "bool",
+    "default": true,
+    "hint": "平台偶尔会把同一条消息重复投递给 AstrBot，历史里就会留下好几条一模一样的记录，模型会以为「对方连着说了好几遍」，甚至在回复里直接说出来。开启后自动合并成一条。"
+  },
   "affection_enabled": {
     "description": "启用好感度",
     "type": "bool",

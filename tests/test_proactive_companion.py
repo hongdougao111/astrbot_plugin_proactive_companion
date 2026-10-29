@@ -2403,6 +2403,104 @@ async def main() -> None:
     plugin._proactive_reply_times.clear()
     plugin._reply_triggered_message_ids.clear()
 
+    print("\n== 31. 上下文重复内容去重 ==")
+
+    # 31.1 注入的上下文里，相同内容只出现一次
+    ctx_umo = "grp:ctx_dup"
+    for _ in range(3):
+        await plugin.store.add_message(ctx_umo, "user", "我们到了吗", "甲", "u-c")
+    dup_block = plugin._format_context_block(
+        await plugin.store.recent_messages(ctx_umo, 20), "", {}, ""
+    )
+    check(
+        "注入块内重复内容只保留一条",
+        dup_block.count("我们到了吗") == 1,
+        dup_block[:200],
+    )
+
+    # 31.2 主动消息上下文（含 AstrBot 历史）同样去重
+    gen_block = main_mod.generator.build_context_block(
+        [
+            {
+                "role": "user",
+                "content": "我们到了吗",
+                "sender": "甲",
+                "sender_id": "u-c",
+            },
+            {
+                "role": "user",
+                "content": "我们到了吗",
+                "sender": "甲",
+                "sender_id": "u-c",
+            },
+        ],
+        ["甲: 我们到了吗"],
+        max_items=12,
+    )
+    check(
+        "主动消息上下文去重",
+        gen_block.count("我们到了吗") == 1,
+        gen_block[:200],
+    )
+
+    # 31.3 LLM 请求历史里的重复消息会被合并
+    class _Req2:
+        def __init__(self) -> None:
+            self.extra_user_content_parts: list[Any] = []
+            self.contexts: list[Any] = [
+                {"role": "user", "content": "同一句话"},
+                {"role": "user", "content": "同一句话"},
+                {"role": "assistant", "content": "收到"},
+                {"role": "user", "content": "同一句话"},
+                {"role": "assistant", "content": "收到"},
+            ]
+
+    req3 = _Req2()
+    removed = plugin._dedupe_request_contexts(req3)
+    check("请求历史去重条数正确", removed == 3, f"removed={removed}")
+    check(
+        "请求历史只剩唯一内容",
+        [c["content"] for c in req3.contexts] == ["同一句话", "收到"],
+        str(req3.contexts),
+    )
+
+    # 31.4 不同角色的相同内容不会被误合并
+    class _Req3:
+        def __init__(self) -> None:
+            self.extra_user_content_parts: list[Any] = []
+            self.contexts: list[Any] = [
+                {"role": "user", "content": "好"},
+                {"role": "assistant", "content": "好"},
+            ]
+
+    req4 = _Req3()
+    plugin._dedupe_request_contexts(req4)
+    check(
+        "不同角色相同内容保留",
+        len(req4.contexts) == 2,
+        str(req4.contexts),
+    )
+
+    # 31.5 关闭开关后不再去重
+    plugin.config["dedupe_llm_context_enabled"] = False
+
+    class _Req5:
+        def __init__(self) -> None:
+            self.extra_user_content_parts: list[Any] = []
+            self.contexts: list[Any] = [
+                {"role": "user", "content": "同一句话"},
+                {"role": "user", "content": "同一句话"},
+            ]
+
+    req5 = _Req5()
+    plugin._dedupe_request_contexts(req5)
+    check(
+        "关闭后不去重",
+        len(req5.contexts) == 2,
+        str(req5.contexts),
+    )
+    plugin.config["dedupe_llm_context_enabled"] = True
+
     shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n" + "=" * 52)

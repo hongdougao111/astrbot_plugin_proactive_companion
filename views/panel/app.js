@@ -67,6 +67,7 @@ const CONFIG_FIELDS = [
   { key: "context_max_chars", label: "注入上下文总长上限", type: "int", min: 200 },
   { key: "context_max_message_chars", label: "单条消息注入长度上限", type: "int", min: 20 },
   { key: "context_blocked_keywords", label: "上下文屏蔽词", type: "text", list: true, hint: "命中的消息不注入给模型；逗号分隔" },
+  { key: "dedupe_llm_context_enabled", label: "去除会话历史中的重复消息", type: "bool", hint: "平台重复投递时，模型会以为「对方连着说了好几遍」，甚至在回复里说出来" },
   { key: "atmosphere_enabled", label: "启用读空气", type: "bool" },
   { key: "atmosphere_window_minutes", label: "气氛判断窗口(分钟)", type: "int", min: 1 },
   { key: "atmosphere_refresh_minutes", label: "气氛刷新间隔(分钟)", type: "int", min: 1 },

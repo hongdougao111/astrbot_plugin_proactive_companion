@@ -74,11 +74,25 @@ def build_context_block(
 
     names 是「用户 ID -> 最新昵称」的映射，用来把历史消息里的旧昵称统一替换
     成用户现在的昵称（改过昵称后上下文里就不会同时出现新旧两个名字）。
+
+    **相同内容只保留一条**：平台偶尔会把同一条消息重复投递给 AstrBot，
+    那样会话历史里就会出现好几条一模一样的记录，模型看到后会以为
+    「对方连着说了三遍」，甚至在回复里直接说出来。这里按「角色 + 内容」
+    去重，模型就只会看到一次。
     """
     lines: list[str] = []
+    seen: set[str] = set()
+
+    def _push(line: str) -> None:
+        key = line.strip()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        lines.append(key)
+
     for item in astro_history or []:
         if isinstance(item, str) and item.strip():
-            lines.append(item.strip())
+            _push(item.strip())
     for msg in recent_messages or []:
         role = msg.get("role", "")
         content = str(msg.get("content", "")).strip()
@@ -89,13 +103,13 @@ def build_context_block(
         if names and sender_id and names.get(sender_id):
             sender = names[sender_id]
         if role == "user":
-            lines.append(f"{sender or '用户'}: {content}")
+            _push(f"{sender or '用户'}: {content}")
         elif role == "bot":
-            lines.append(f"我: {content}")
+            _push(f"我: {content}")
         elif role == "proactive":
-            lines.append(f"我(主动): {content}")
+            _push(f"我(主动): {content}")
         else:
-            lines.append(f"{sender or '对方'}: {content}")
+            _push(f"{sender or '对方'}: {content}")
     if not lines:
         return ""
     return "\n".join(lines[-max_items:])

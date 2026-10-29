@@ -104,6 +104,9 @@ SAFE_DEFAULTS: dict[str, Any] = {
     "context_max_chars": 1200,
     "context_max_message_chars": 200,
     "context_blocked_keywords": [],
+    # 去掉 LLM 请求历史里重复的消息：平台重复投递时，模型会以为
+    # 「对方连着说了好几遍」，甚至在回复里直接说出来。
+    "dedupe_llm_context_enabled": True,
     "atmosphere_enabled": True,
     "atmosphere_window_minutes": 30,
     "atmosphere_refresh_minutes": 3,
@@ -413,7 +416,19 @@ class ProactiveCompanionPlugin(Star):
         AstrBot 自身的会话历史只包含「机器人参与过」的对话，群里其他人聊天
         并不在里面，所以主动回复必须由插件把上下文补上。
         注入的内容标记为临时内容，不会写入会话历史。
+
+        顺带在这里对 **AstrBot 自己的会话历史做去重**：平台偶尔会把同一条
+        消息重复投递给 AstrBot，历史里就会留下好几条一模一样的记录，
+        模型看到后会以为「对方连着说了三遍」，甚至直接在回复里说出来。
         """
+        # 先去掉请求历史里的重复消息（对所有 LLM 请求生效）
+        try:
+            removed = self._dedupe_request_contexts(req)
+            if removed:
+                logger.info(f"[主动陪伴] 已从会话历史中去重 {removed} 条重复消息")
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"[主动陪伴] 清理会话历史重复消息失败: {exc}")
+
         umo = event.get_extra(_PROACTIVE_SESSION_KEY)
         if not umo or TextPart is None:
             return
@@ -582,19 +597,26 @@ class ProactiveCompanionPlugin(Star):
             return name
 
         lines: list[str] = []
+        seen_lines: set[str] = set()
         for msg in messages:
             content = str(msg.get("content") or "").strip()
             if not content:
                 continue
             role = str(msg.get("role") or "")
             if role == "user":
-                lines.append(f"{_label(msg)}: {content}")
+                line = f"{_label(msg)}: {content}"
             elif role == "bot":
-                lines.append(f"我: {content}")
+                line = f"我: {content}"
             elif role == "proactive":
-                lines.append(f"我(之前主动搭话): {content}")
+                line = f"我(之前主动搭话): {content}"
             else:
-                lines.append(f"{_label(msg)}: {content}")
+                line = f"{_label(msg)}: {content}"
+            # 同一条消息只保留一份：平台重复投递时记录里会出现好几条一样的，
+            # 模型看到会以为「对方说了好几遍」，甚至在回复里说出来。
+            if line in seen_lines:
+                continue
+            seen_lines.add(line)
+            lines.append(line)
         if not lines:
             return atmosphere_hint
         body = "\n".join(lines)
@@ -938,6 +960,58 @@ class ProactiveCompanionPlugin(Star):
         # 如果等到 handler 里才记，同一条消息被重复投递时会连续判定通过。
         self._proactive_reply_times[umo] = time.time()
         return True, "命中"
+
+    def _dedupe_request_contexts(self, req: Any) -> int:
+        """把 LLM 请求里的会话历史去重：相同角色 + 相同内容只保留一条。
+
+        平台偶尔会把同一条消息重复投递给 AstrBot，历史里就会留下好几条
+        一模一样的记录，模型看到后会以为「对方连着说了三遍」，甚至在回复里
+        直接说出来。这里在请求发出前把它们合并掉。
+
+        返回被去掉的条数；结构不认识时原样返回，不做任何修改。
+        """
+        if not self._cfg_bool("dedupe_llm_context_enabled", True):
+            return 0
+        contexts = getattr(req, "contexts", None)
+        if not isinstance(contexts, list) or len(contexts) < 2:
+            return 0
+
+        def _key(item: Any) -> tuple[str, str]:
+            if isinstance(item, dict):
+                role = str(item.get("role") or "")
+                content = item.get("content")
+            else:
+                role = str(getattr(item, "role", "") or "")
+                content = getattr(item, "content", None)
+            if isinstance(content, list):
+                # 多模态内容：取一个稳定的字符串表示
+                try:
+                    content = json.dumps(content, ensure_ascii=False, sort_keys=True)
+                except Exception:  # pragma: no cover
+                    content = str(content)
+            text = str(content or "").strip()
+            return role, text
+
+        seen: set[tuple[str, str]] = set()
+        kept: list[Any] = []
+        removed = 0
+        for item in contexts:
+            key = _key(item)
+            if not key[1]:
+                # 没有内容的条目（例如空的占位）直接丢掉
+                removed += 1
+                continue
+            if key in seen:
+                removed += 1
+                continue
+            seen.add(key)
+            kept.append(item)
+        if removed and len(kept) > 0:
+            try:
+                req.contexts = kept
+            except Exception:  # pragma: no cover - 只读属性时跳过
+                return 0
+        return removed
 
     @staticmethod
     def _message_id(event: AstrMessageEvent) -> str:
