@@ -995,10 +995,17 @@ class ProactiveCompanionPlugin(Star):
         seen: set[tuple[str, str]] = set()
         kept: list[Any] = []
         removed = 0
+        # 当前这一轮的 prompt 会单独发给模型；如果历史里已经有内容完全一样的
+        # 那条用户消息，就会被模型数成两次（平台再重复投递一次就成了三次）。
+        # 这种情况下保留 prompt 那一次，把历史里的重复条目去掉。
+        prompt_text = str(getattr(req, "prompt", "") or "").strip()
         for item in contexts:
             key = _key(item)
             if not key[1]:
                 # 没有内容的条目（例如空的占位）直接丢掉
+                removed += 1
+                continue
+            if prompt_text and key[0] == "user" and key[1] == prompt_text:
                 removed += 1
                 continue
             if key in seen:
@@ -2252,6 +2259,27 @@ class ProactiveCompanionPlugin(Star):
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @companion.command("去重", alias={"dedupe", "去重复", "清理重复"})
+    async def companion_dedupe(self, event: AstrMessageEvent):
+        """清理重复的聊天记录
+
+        旧版本在平台重复投递消息时，会把同一条消息记成好几份，
+        导致机器人以为「你说了好几遍」。这个指令会把重复的记录合并掉。
+        """
+        removed = await self.store.prune_duplicate_messages()
+        await self.store.add_event("messages_deduped", event.unified_msg_origin)
+        if removed:
+            await self.store.backfill_profiles()
+        yield event.plain_result(
+            f"已清理 {removed} 条重复的聊天记录。"
+            + (
+                "（重复内容太多，建议过几分钟再看看机器人还会不会重复计数）"
+                if removed
+                else ""
+            )
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command(
         "清除记忆",
         alias={"clear-memory", "forget", "忘记", "忘一忘", "清记忆", "purge"},
@@ -2447,6 +2475,12 @@ class ProactiveCompanionPlugin(Star):
             self.api_toggle_session,
             ["POST"],
             "开关会话主动消息",
+        )
+        ctx.register_web_api(
+            f"/{PLUGIN_NAME}/messages/dedupe",
+            self.api_dedupe_messages,
+            ["POST"],
+            "清理重复的聊天记录",
         )
         ctx.register_web_api(
             f"/{PLUGIN_NAME}/sessions/delete",
@@ -2842,6 +2876,17 @@ class ProactiveCompanionPlugin(Star):
         return json_response(
             {"sessions": result, "total": len(result), "atmosphere_levels": levels}
         )
+
+    async def api_dedupe_messages(self):
+        """清理重复的聊天记录（面板按钮）。"""
+        removed = await self.store.prune_duplicate_messages()
+        await self.store.add_event("messages_deduped", "", {"removed": removed})
+        if removed:
+            try:
+                await self.store.backfill_profiles()
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f"[主动陪伴] 重建画像失败: {exc}")
+        return json_response({"removed": removed})
 
     async def api_toggle_session(self):
         """开启/关闭某个会话的主动消息。"""

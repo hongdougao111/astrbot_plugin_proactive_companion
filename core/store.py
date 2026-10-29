@@ -954,6 +954,46 @@ class Store:
 
         return await self._run(_do)
 
+    async def prune_duplicate_messages(self, window_seconds: float = 300.0) -> int:
+        """清理重复的聊天记录，返回删除条数。
+
+        旧版本插件在平台重复投递消息时，会把同一条消息记成好几份。
+        这里把「同一会话、同一角色、同一发送者、同一内容」且时间相近的记录
+        只保留最新的一条，其余删除。
+        """
+
+        def _do(conn: sqlite3.Connection) -> int:
+            rows = conn.execute(
+                "SELECT id, session_key, role, sender_id, content, ts FROM messages"
+                " ORDER BY session_key, role, sender_id, content, ts DESC, id DESC"
+            ).fetchall()
+            seen: dict[tuple[str, str, str, str], float] = {}
+            victims: list[int] = []
+            for row in rows:
+                key = (
+                    str(row["session_key"]),
+                    str(row["role"]),
+                    str(row["sender_id"]),
+                    str(row["content"]),
+                )
+                ts = float(row["ts"])
+                kept_ts = seen.get(key)
+                if kept_ts is None:
+                    seen[key] = ts
+                    continue
+                # 只有时间上靠得很近的才算重复；隔很久说同一句话不算重复
+                if kept_ts - ts <= float(window_seconds):
+                    victims.append(int(row["id"]))
+                else:
+                    seen[key] = ts
+            removed = 0
+            for vid in victims:
+                cur = conn.execute("DELETE FROM messages WHERE id = ?", (vid,))
+                removed += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            return removed
+
+        return await self._run(_do)
+
     async def clear_user_memory(
         self, user_id: str, keep_messages: bool = False
     ) -> dict[str, int]:

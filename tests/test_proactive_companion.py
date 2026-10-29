@@ -1527,7 +1527,7 @@ async def main() -> None:
 
     # 23.6 指令仅限管理员使用
     cmds = getattr(plugin.companion, "commands", {})
-    check("指令组下有 12 条子指令", len(cmds) == 12, str(sorted(cmds)))
+    check("指令组下有 13 条子指令", len(cmds) == 13, str(sorted(cmds)))
     non_admin = [
         name
         for name, func in cmds.items()
@@ -2500,6 +2500,74 @@ async def main() -> None:
         str(req5.contexts),
     )
     plugin.config["dedupe_llm_context_enabled"] = True
+
+    # 31.8 库里的重复记录可以被清理
+    dup2_umo = "grp:dup_clean"
+    now = time.time()
+    for offset in (0, 1, 2):
+        await plugin.store.add_message(
+            dup2_umo, "user", "同一句", "甲", "u-dc", ts=now - offset
+        )
+    # 很久以前说的同一句不算重复
+    await plugin.store.add_message(
+        dup2_umo, "user", "同一句", "甲", "u-dc", ts=now - 86400
+    )
+    before = len(await plugin.store.recent_messages(dup2_umo, 50))
+    removed_dup = await plugin.store.prune_duplicate_messages()
+    after_rows = await plugin.store.recent_messages(dup2_umo, 50)
+    check("清理了重复记录", removed_dup >= 2, f"removed={removed_dup} before={before}")
+    check(
+        "重复内容只剩一条（隔很久的那条保留）",
+        sum(1 for m in after_rows if m["content"] == "同一句") == 2,
+        str(after_rows),
+    )
+
+    # 31.9 去重指令可用
+    dedupe_res = await mock_await_result(
+        plugin.companion_dedupe(MockEvent(dup2_umo, "陪伴 去重"))
+    )
+    check(
+        "去重指令有回复",
+        dedupe_res is not None and "重复" in dedupe_res[1],
+        str(dedupe_res),
+    )
+
+    # 31.6 历史里与当前 prompt 相同的那条会被去掉（否则模型会数成两次）
+    class _Req6:
+        def __init__(self) -> None:
+            self.extra_user_content_parts: list[Any] = []
+            self.prompt = "我发了一条"
+            self.contexts: list[Any] = [
+                {"role": "user", "content": "我发了一条"},
+                {"role": "assistant", "content": "收到"},
+                {"role": "user", "content": "我发了一条"},
+            ]
+
+    req6 = _Req6()
+    removed6 = plugin._dedupe_request_contexts(req6)
+    check(
+        "历史里与 prompt 重复的条目被去掉",
+        removed6 == 2 and len(req6.contexts) == 1,
+        f"removed={removed6} {req6.contexts}",
+    )
+
+    # 31.7 prompt 与历史内容不同则不动
+    class _Req7:
+        def __init__(self) -> None:
+            self.extra_user_content_parts: list[Any] = []
+            self.prompt = "这是新的问题"
+            self.contexts: list[Any] = [
+                {"role": "user", "content": "我发了一条"},
+                {"role": "assistant", "content": "收到"},
+            ]
+
+    req7 = _Req7()
+    plugin._dedupe_request_contexts(req7)
+    check(
+        "prompt 不同时历史保持原样",
+        len(req7.contexts) == 2,
+        str(req7.contexts),
+    )
 
     shutil.rmtree(tmp, ignore_errors=True)
 

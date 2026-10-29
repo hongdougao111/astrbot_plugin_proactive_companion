@@ -521,6 +521,21 @@ function bindActions() {
     toast("调度器将在下一个周期自动检查");
   });
 
+  $("#btn-dedupe").addEventListener("click", async () => {
+    const btn = $("#btn-dedupe");
+    btn.disabled = true;
+    try {
+      const res = await bridge.apiPost("messages/dedupe", {});
+      const removed = (res && res.removed) || 0;
+      toast(removed ? `已清理 ${removed} 条重复记录` : "没有发现重复记录");
+      await Promise.all([loadState(), loadSessions(), loadEvents()]);
+    } catch (err) {
+      toast(err.message || "清理失败", true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
   $("#btn-save-config").addEventListener("click", saveConfig);
 
   $("#btn-close-msgs").addEventListener("click", () => {
