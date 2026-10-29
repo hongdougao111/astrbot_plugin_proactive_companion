@@ -304,18 +304,38 @@ class Store:
         sender: str = "",
         sender_id: str = "",
         ts: float | None = None,
-    ) -> None:
-        """写入一条消息。sender 是昵称，sender_id 是用户唯一标识。"""
+        dedupe_window: float = 0.0,
+    ) -> bool:
+        """写入一条消息。sender 是昵称，sender_id 是用户唯一标识。
+
+        dedupe_window > 0 时启用**内容级幂等**：如果最近这段时间内已经存在
+        完全相同（同会话、同角色、同发送者、同内容）的记录，就不再重复写入。
+
+        这是为了兜住「同一条群消息被插件的多个入口各记一次」的情况——
+        采集、主动回复、事件收尾三条路径都会写消息，去重标志在事件对象上，
+        一旦平台重复投递事件就会各写各的，导致一句话被记成两三句。
+        返回 True 表示真的写入了。
+        """
         ts = time.time() if ts is None else ts
 
-        def _do(conn: sqlite3.Connection) -> None:
+        def _do(conn: sqlite3.Connection) -> bool:
+            if dedupe_window > 0:
+                since = ts - float(dedupe_window)
+                dup = conn.execute(
+                    "SELECT id FROM messages WHERE session_key = ? AND role = ?"
+                    " AND sender_id = ? AND content = ? AND ts >= ? LIMIT 1",
+                    (session_key, role, sender_id, content, since),
+                ).fetchone()
+                if dup is not None:
+                    return False
             conn.execute(
                 "INSERT INTO messages (session_key, role, sender, sender_id, content, ts)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
                 (session_key, role, sender, sender_id, content, ts),
             )
+            return True
 
-        await self._run(_do)
+        return await self._run(_do)
 
     async def recent_messages(
         self, session_key: str, limit: int = 20

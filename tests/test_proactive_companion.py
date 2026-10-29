@@ -143,6 +143,7 @@ class MockEvent:
         sender: str = "user-1",
         self_id: str = "bot-1",
         mentions: bool = False,
+        message_id: str = "",
     ) -> None:
         self.unified_msg_origin = umo
         self.message_str = text
@@ -151,6 +152,7 @@ class MockEvent:
         self._group_id = group_id
         self._sender = sender
         self._self_id = self_id
+        self._message_id = message_id
         self.message_obj = types.SimpleNamespace(
             message=[MockComponent("At", qq=self_id)] if mentions else [],
             group_id=group_id,
@@ -196,6 +198,9 @@ class MockEvent:
 
     def get_self_id(self) -> str:
         return self._self_id
+
+    def get_message_id(self) -> str:
+        return self._message_id
 
     def is_private_chat(self) -> bool:
         return "Friend" in self._chat_type
@@ -2313,6 +2318,90 @@ async def main() -> None:
 
     plugin.config["keep_messages_per_session"] = 200
     plugin.config["keep_messages_days"] = 30
+
+    print("\n== 30. 重复消息与重复投递防护 ==")
+    dup_umo = "grp:dup_test"
+
+    # 30.1 短窗口内同一条消息只入库一次
+    ok1 = await plugin.store.add_message(
+        dup_umo, "user", "只应记一次", "甲", "u-dup", dedupe_window=30.0
+    )
+    ok2 = await plugin.store.add_message(
+        dup_umo, "user", "只应记一次", "甲", "u-dup", dedupe_window=30.0
+    )
+    dup_rows = await plugin.store.recent_messages(dup_umo, 50)
+    check("重复写入被拦下", ok1 and not ok2, f"{ok1} {ok2}")
+    check(
+        "同一句话只入库一次",
+        sum(1 for m in dup_rows if m["content"] == "只应记一次") == 1,
+        str(dup_rows),
+    )
+
+    # 30.2 不开启去重时照常写入
+    await plugin.store.add_message(dup_umo, "user", "只应记一次", "甲", "u-dup")
+    dup_rows2 = await plugin.store.recent_messages(dup_umo, 50)
+    check(
+        "关闭去重时仍然写入",
+        sum(1 for m in dup_rows2 if m["content"] == "只应记一次") == 2,
+        str(dup_rows2),
+    )
+
+    # 30.3 不同发送者的相同内容不算重复
+    await plugin.store.add_message(
+        dup_umo, "user", "只应记一次", "乙", "u-other", dedupe_window=30.0
+    )
+    dup_rows3 = await plugin.store.recent_messages(dup_umo, 50)
+    check(
+        "不同人说的同一句话各自保留",
+        sum(1 for m in dup_rows3 if m["content"] == "只应记一次") == 3,
+        str(dup_rows3),
+    )
+
+    # 30.4 三条写入路径都走同一条消息时，最终只记一条
+    path_umo = "grp:dup_paths"
+    await plugin._record_user_message(path_umo, "同一句话", "甲", "u-paths")
+    await plugin._record_user_message(path_umo, "同一句话", "甲", "u-paths")
+    await plugin._record_user_message(path_umo, "同一句话", "甲", "u-paths")
+    path_rows = await plugin.store.recent_messages(path_umo, 50)
+    check(
+        "多条路径写入同一条消息只留一条",
+        len(path_rows) == 1,
+        str(path_rows),
+    )
+
+    # 30.5 同一条消息被重复投递时不会连续触发主动回复
+    plugin.config["proactive_reply_enabled"] = True
+    plugin.config["proactive_reply_probability"] = 1.0
+    plugin.config["proactive_reply_cooldown_minutes"] = 0
+    plugin.config["proactive_reply_min_length"] = 2
+    plugin._proactive_reply_times.clear()
+    plugin._reply_triggered_message_ids.clear()
+    dup_event = MockEvent(
+        dup_umo, "重复投递的消息", chat_type="GroupMessage", message_id="m-123"
+    )
+    first = plugin.should_proactive_reply(dup_event, None)
+    second = plugin.should_proactive_reply(dup_event, None)
+    third = plugin.should_proactive_reply(dup_event, None)
+    check("首次投递可以触发", first, f"{first}")
+    check("重复投递不再触发", not second and not third, f"{second} {third}")
+
+    # 30.6 没有 message_id 时靠冷却挡住重复
+    plugin._proactive_reply_times.clear()
+    plugin._reply_triggered_message_ids.clear()
+    plugin.config["proactive_reply_cooldown_minutes"] = 10
+    no_mid = MockEvent(dup_umo, "没有消息ID", chat_type="GroupMessage")
+    check(
+        "无消息ID时第一次触发",
+        plugin.should_proactive_reply(no_mid, None),
+    )
+    check(
+        "无消息ID时第二次被冷却挡住",
+        not plugin.should_proactive_reply(no_mid, None),
+    )
+    plugin.config["proactive_reply_cooldown_minutes"] = 10
+    plugin.config["proactive_reply_probability"] = 0.2
+    plugin._proactive_reply_times.clear()
+    plugin._reply_triggered_message_ids.clear()
 
     shutil.rmtree(tmp, ignore_errors=True)
 

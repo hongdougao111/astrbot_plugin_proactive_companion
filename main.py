@@ -207,6 +207,8 @@ class ProactiveCompanionPlugin(Star):
         self._last_tick_error: str = ""
         # 主动回复：记录每个会话上次触发的时间，用于冷却
         self._proactive_reply_times: dict[str, float] = {}
+        # 已经触发过主动回复的消息 ID：防止同一条消息被重复投递时连发多条
+        self._reply_triggered_message_ids: set[str] = set()
         # 被动采集：已经被记录过对话的会话
         self._tracked_sessions: set[str] = set()
         # 最近一次主动回复判定结果，便于在面板上排查为什么没触发
@@ -648,6 +650,33 @@ class ProactiveCompanionPlugin(Star):
         task = loop.create_task(self._capture_message(event, content))
         task.add_done_callback(self._on_capture_done)
 
+    # 用户消息的入库去重窗口（秒）：同一会话、同一发送者、同一内容在这个
+    # 窗口内只会入库一次，防止一句话被记成两三句。
+    _USER_DEDUPE_WINDOW = 30.0
+
+    async def _record_user_message(
+        self,
+        session_key: str,
+        content: str,
+        sender: str = "",
+        sender_id: str = "",
+    ) -> bool:
+        """写入一条用户消息，短时间内重复的同一条内容会被忽略。"""
+        try:
+            return bool(
+                await self.store.add_message(
+                    session_key,
+                    "user",
+                    content,
+                    sender,
+                    sender_id,
+                    dedupe_window=self._USER_DEDUPE_WINDOW,
+                )
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"[主动陪伴] 写入用户消息失败: {exc}")
+            return False
+
     def _on_capture_done(self, task: Any) -> None:
         try:
             if task.cancelled():
@@ -675,7 +704,7 @@ class ProactiveCompanionPlugin(Star):
             self._session_title(event),
         )
         self._tracked_sessions.add(umo)
-        await self.store.add_message(umo, "user", content, sender, sender_id)
+        await self._record_user_message(umo, content, sender, sender_id)
         await self._update_affection(
             umo, sender_id, sender, content, event="user_message"
         )
@@ -792,9 +821,8 @@ class ProactiveCompanionPlugin(Star):
             self._session_title(event),
         )
         if not event.get_extra(_CAPTURED_FLAG, False):
-            await self.store.add_message(
+            await self._record_user_message(
                 umo,
-                "user",
                 (event.message_str or "").strip(),
                 event.get_sender_name() or "",
                 str(event.get_sender_id() or ""),
@@ -897,7 +925,36 @@ class ProactiveCompanionPlugin(Star):
             probability = min(1.0, probability * affection.probability_factor(score))
         if probability < 1.0 and random.random() >= probability:
             return False, f"未命中概率（{probability:.2f}）"
+        # 同一条消息（message_id 相同）只允许触发一次主动回复。
+        # 平台偶尔会把同一条消息重复投递给插件，如果不去重，
+        # 就会在群里连着发好几条一模一样的回复。
+        mid = self._message_id(event)
+        if mid:
+            if mid in self._reply_triggered_message_ids:
+                return False, "这条消息已经触发过主动回复"
+            self._reply_triggered_message_ids.add(mid)
+            self._prune_reply_triggered_ids()
+        # 判定通过时就立刻占用冷却时间戳：handler 是异步执行的，
+        # 如果等到 handler 里才记，同一条消息被重复投递时会连续判定通过。
+        self._proactive_reply_times[umo] = time.time()
         return True, "命中"
+
+    @staticmethod
+    def _message_id(event: AstrMessageEvent) -> str:
+        """取消息唯一 ID（平台不一定提供，取不到就返回空串）。"""
+        try:
+            getter = getattr(event, "get_message_id", None)
+            if callable(getter):
+                return str(getter() or "")
+        except Exception:  # pragma: no cover
+            pass
+        return ""
+
+    def _prune_reply_triggered_ids(self) -> None:
+        """清理过期的「已触发主动回复的消息 ID」，避免集合无限增长。"""
+        if len(self._reply_triggered_message_ids) < 500:
+            return
+        self._reply_triggered_message_ids.clear()
 
     def _looks_like_command(self, content: str, cfg: Any) -> bool:
         """判断消息是否是指令（指令消息不参与主动回复）。"""
@@ -1019,9 +1076,11 @@ class ProactiveCompanionPlugin(Star):
 
         if content and not event.get_extra(_CAPTURED_FLAG, False):
             # 被动采集已经记录过这条消息时不要重复入库
-            await self.store.add_message(umo, "user", content, sender_name, sender_id)
+            await self._record_user_message(umo, content, sender_name, sender_id)
         if reply:
-            await self.store.add_message(umo, "bot", reply, "bot", "")
+            await self.store.add_message(
+                umo, "bot", reply, "bot", "", dedupe_window=10.0
+            )
             if sender_id:
                 await self._update_affection(
                     umo, sender_id, sender_name, event="bot_reply"
@@ -1722,7 +1781,9 @@ class ProactiveCompanionPlugin(Star):
             return
         sent = await self._deliver(umo, text)
         if sent:
-            await self.store.add_message(umo, "proactive", text, "bot")
+            await self.store.add_message(
+                umo, "proactive", text, "bot", "", dedupe_window=10.0
+            )
             await self.store.update_session(
                 umo,
                 last_proactive_at=time.time(),
@@ -2769,7 +2830,9 @@ class ProactiveCompanionPlugin(Star):
             return json_response({"sent": False, "reason": "没有可发送的内容"})
         sent = await self._deliver(key, text)
         if sent:
-            await self.store.add_message(key, "proactive", text, "bot")
+            await self.store.add_message(
+                key, "proactive", text, "bot", "", dedupe_window=10.0
+            )
             await self.store.update_session(
                 key,
                 last_proactive_at=time.time(),
