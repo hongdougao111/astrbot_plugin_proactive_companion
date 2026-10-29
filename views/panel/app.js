@@ -24,6 +24,12 @@ const CONFIG_FIELDS = [
   { key: "idle_jitter_ratio", label: "静默阈值抖动比例", type: "float", min: 0 },
   { key: "group_enabled", label: "允许群聊主动发言", type: "bool" },
   { key: "private_enabled", label: "允许私聊主动发言", type: "bool" },
+  { key: "private_min_idle_minutes", label: "私聊·最小静默时长(分钟)", type: "int", min: 0, hint: "0 = 跟随全局" },
+  { key: "private_cooldown_minutes", label: "私聊·两次消息间隔(分钟)", type: "int", min: 0, hint: "0 = 跟随全局" },
+  { key: "private_max_daily_messages", label: "私聊·每日上限(0=跟随全局)", type: "int", min: 0 },
+  { key: "private_quiet_hours", label: "私聊·免打扰时段", type: "text", list: true, hint: "留空 = 跟随全局；如 23:30-08:00" },
+  { key: "private_skip_atmosphere", label: "私聊不受气氛规则限制", type: "bool", hint: "两人对话不套用群聊的「冷清/热闹/紧张」判定" },
+  { key: "private_priority", label: "私聊优先发言", type: "bool", hint: "每轮名额有限时优先给私聊" },
   { key: "mention_only_in_group", label: "群聊仅被 @ 后发言", type: "bool" },
   { key: "mood_enabled", label: "启用动态情绪", type: "bool" },
   { key: "mood_decay_per_hour", label: "情绪衰减速度 / 小时", type: "float", min: 0 },
@@ -108,6 +114,17 @@ async function loadState() {
     ["调度器", data.running ? "在线" : "未启动"],
     ["检查间隔", `${data.interval} 秒`],
     ["免打扰时段", (data.quiet_hours || []).join("、") || "未设置"],
+    [
+      "私聊阈值",
+      (() => {
+        const pl = data.private_limits;
+        if (!pl) return "—";
+        const quiet = (pl.quiet_hours || []).join("、");
+        return `静默 ${pl.min_idle} 分钟 / 间隔 ${pl.cooldown} 分钟 / 每日 ${pl.max_daily} 条${
+          quiet ? ` / 免打扰 ${quiet}` : ""
+        }`;
+      })(),
+    ],
     ["下一次可打扰", data.next_available || "现在"],
     ["情绪标签", data.mood_label],
     ["主动回复", data.proactive_reply_enabled ? "已开启" : "未开启"],

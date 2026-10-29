@@ -60,6 +60,45 @@
     "type": "bool",
     "default": true
   },
+  "private_min_idle_minutes": {
+    "description": "私聊·最小静默时长（分钟）",
+    "type": "int",
+    "default": 15,
+    "hint": "对方安静这么久 Bot 就会考虑在私聊里主动开口，比群里更积极。设为 0 表示跟随全局的「最小静默时长」。"
+  },
+  "private_cooldown_minutes": {
+    "description": "私聊·两次主动消息最小间隔（分钟）",
+    "type": "int",
+    "default": 60,
+    "hint": "私聊里两次主动搭话之间的最小间隔，比群里短。设为 0 表示跟随全局。"
+  },
+  "private_max_daily_messages": {
+    "description": "私聊·每会话每日主动消息上限",
+    "type": "int",
+    "default": 10,
+    "hint": "私聊的每日额度独立于群聊。设为 0 表示跟随全局的上限设置。"
+  },
+  "private_quiet_hours": {
+    "description": "私聊·免打扰时段",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "只对私聊生效，格式如 23:30-08:00。留空表示沿用全局免打扰时段。"
+  },
+  "private_skip_atmosphere": {
+    "description": "私聊不受气氛规则限制",
+    "type": "bool",
+    "default": true,
+    "hint": "群聊的「冷清/热闹/紧张」判定用在两个人私聊上容易误伤（例如一句气话被判成紧张后彻底闭嘴），开启后私聊不看气氛，更敢说话。"
+  },
+  "private_priority": {
+    "description": "私聊优先发言",
+    "type": "bool",
+    "default": true,
+    "hint": "每轮主动发言名额有限时，优先照顾私聊会话。"
+  },
   "mention_only_in_group": {
     "description": "群聊中仅在被 @ 后才主动发言",
     "type": "bool",

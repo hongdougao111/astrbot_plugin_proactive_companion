@@ -596,6 +596,13 @@ async def main() -> None:
             "group_enabled": True,
             "private_enabled": True,
             "mention_only_in_group": False,
+            # 测试里让私聊沿用全局阈值（0 = 跟随全局），单独策略另有专项用例
+            "private_min_idle_minutes": 0,
+            "private_cooldown_minutes": 0,
+            "private_max_daily_messages": 0,
+            "private_quiet_hours": [],
+            "private_skip_atmosphere": True,
+            "private_priority": True,
             "mood_enabled": True,
             "mood_decay_per_hour": 0.15,
             "tts_enabled": False,
@@ -1828,6 +1835,192 @@ async def main() -> None:
         (profile_nick or {}).get("nickname") == "平台昵称3",
         str(profile_nick),
     )
+
+    print("\n== 27. 私聊专属主动策略 ==")
+    # 27.1 私聊阈值独立于群聊
+    plugin.config["min_idle_minutes"] = 45
+    plugin.config["cooldown_minutes"] = 180
+    plugin.config["max_daily_messages"] = 6
+    plugin.config["private_min_idle_minutes"] = 15
+    plugin.config["private_cooldown_minutes"] = 60
+    plugin.config["private_max_daily_messages"] = 10
+    private_limits = plugin._effective_limits("private")
+    group_limits = plugin._effective_limits("group")
+    check("私聊静默阈值更短", private_limits["min_idle"] == 15, str(private_limits))
+    check("私聊冷却更短", private_limits["cooldown"] == 60, str(private_limits))
+    check("私聊每日额度更高", private_limits["max_daily"] == 10, str(private_limits))
+    check(
+        "群聊阈值不受影响",
+        group_limits["min_idle"] == 45 and group_limits["cooldown"] == 180,
+        str(group_limits),
+    )
+
+    # 27.2 设为 0 时回落到全局
+    plugin.config["private_min_idle_minutes"] = 0
+    plugin.config["private_cooldown_minutes"] = 0
+    plugin.config["private_max_daily_messages"] = 0
+    fallback = plugin._effective_limits("private")
+    check(
+        "私聊设为 0 时跟随全局",
+        fallback["min_idle"] == 45
+        and fallback["cooldown"] == 180
+        and fallback["max_daily"] == 6,
+        str(fallback),
+    )
+
+    # 27.3 私聊免打扰时段独立
+    plugin.config["private_quiet_hours"] = ["23:30-08:00"]
+    quiet_limits = plugin._effective_limits("private")
+    check(
+        "私聊使用自己的免打扰时段",
+        quiet_limits["quiet_hours"] == ["23:30-08:00"],
+        str(quiet_limits),
+    )
+    check(
+        "群聊免打扰时段不受影响",
+        plugin._effective_limits("group")["quiet_hours"] == [],
+        str(plugin._effective_limits("group")),
+    )
+    plugin.config["private_quiet_hours"] = []
+
+    # 27.4 私聊优先调度
+    plugin.config["private_priority"] = True
+    ordered = plugin._order_sessions(
+        [
+            {"session_key": "g1", "chat_type": "group"},
+            {"session_key": "p1", "chat_type": "private"},
+            {"session_key": "g2", "chat_type": "group"},
+            {"session_key": "p2", "chat_type": "private"},
+        ]
+    )
+    types = [str(s.get("chat_type")) for s in ordered]
+    check("私聊排在群聊前面", types[:2] == ["private", "private"], str(types))
+    check("群聊排在后面", types[2:] == ["group", "group"], str(types))
+    plugin.config["private_priority"] = False
+    ordered2 = plugin._order_sessions(
+        [
+            {"session_key": "g1", "chat_type": "group"},
+            {"session_key": "p1", "chat_type": "private"},
+        ]
+    )
+    check(
+        "关闭优先后顺序打散",
+        len(ordered2) == 2
+        and {str(s.get("chat_type")) for s in ordered2} == {"group", "private"},
+        str(ordered2),
+    )
+    plugin.config["private_priority"] = True
+
+    # 27.5 私聊不受气氛规则限制（默认开启）
+    check(
+        "默认私聊跳过气氛判定",
+        plugin._cfg_bool("private_skip_atmosphere", True) is True,
+    )
+    plugin.config["private_skip_atmosphere"] = False
+    check(
+        "可关闭私聊跳过气氛",
+        plugin._cfg_bool("private_skip_atmosphere", True) is False,
+    )
+    plugin.config["private_skip_atmosphere"] = True
+
+    # 27.6 私聊提示词更口语化
+    priv_prompt = gen.build_prompt(
+        "用户: 在吗", emotion_mod.EmotionState(), 20.0, is_group=False
+    )
+    check("私聊提示词提到一对一", "一对一" in priv_prompt, priv_prompt[:200])
+
+    # 27.7 面板可读写私聊配置
+    cfg_req = MockRequest()
+    request_holder["current"] = cfg_req
+    cfg_req.set_json(
+        {
+            "config": {
+                "private_min_idle_minutes": 20,
+                "private_cooldown_minutes": 90,
+                "private_max_daily_messages": 12,
+                "private_skip_atmosphere": False,
+                "private_priority": False,
+            }
+        }
+    )
+    resp = await plugin.api_save_config()
+    check("面板保存私聊配置成功", resp.payload.get("saved") is True, str(resp.payload))
+    saved = resp.payload.get("config") or {}
+    check("私聊静默阈值已保存", saved.get("private_min_idle_minutes") == 20, str(saved))
+    check(
+        "私聊跳过气氛已保存", saved.get("private_skip_atmosphere") is False, str(saved)
+    )
+    check(
+        "保存后立即生效",
+        plugin._effective_limits("private")["min_idle"] == 20,
+        str(plugin._effective_limits("private")),
+    )
+    cfg_req.set_json({})
+
+    # 27.8 私聊里即使气氛「紧张」也照样主动开口
+    from core import atmosphere as atmo_mod  # type: ignore
+
+    tense_umo = "aiocqhttp:FriendMessage:tense1"
+    await plugin.store.ensure_session(
+        tense_umo, tense_umo, "aiocqhttp", "private", "私聊会话"
+    )
+    await plugin.store.update_session(tense_umo, enabled=1)
+    now2 = time.time()
+    plugin._atmosphere_cache[tense_umo] = atmo_mod.analyze(
+        [
+            {
+                "content": "你真傻逼滚蛋",
+                "sender": "u",
+                "sender_id": "u",
+                "ts": now2,
+                "role": "user",
+            }
+        ],
+        now=now2,
+    )
+    check(
+        "测试用气氛确实被判为紧张",
+        plugin._atmosphere_cache[tense_umo].level == atmo_mod.LEVEL_TENSE,
+        plugin._atmosphere_cache[tense_umo].level,
+    )
+    plugin.config["min_idle_minutes"] = 0
+    plugin.config["cooldown_minutes"] = 0
+    plugin.config["max_daily_messages"] = 50
+    plugin.config["max_proactive_per_tick"] = 50
+    plugin.config["private_min_idle_minutes"] = 0
+    plugin.config["private_cooldown_minutes"] = 0
+    plugin.config["private_max_daily_messages"] = 0
+    plugin.config["private_skip_atmosphere"] = True
+    ctx.sent.clear()
+    await plugin.tick()
+    check(
+        "私聊不受气氛紧张影响，照样主动搭话",
+        len(ctx.sent_to(tense_umo)) == 1,
+        f"sent={len(ctx.sent_to(tense_umo))}",
+    )
+
+    # 反过来：群聊仍受气氛影响
+    plugin.config["private_skip_atmosphere"] = False
+    ctx.sent.clear()
+    await plugin.tick()
+    check(
+        "群聊仍受气氛规则约束",
+        len(ctx.sent_to(tense_umo)) == 0,
+        f"sent={len(ctx.sent_to(tense_umo))}",
+    )
+    plugin.config["private_skip_atmosphere"] = True
+    plugin._atmosphere_cache.pop(tense_umo, None)
+
+    # 恢复默认，避免影响其它用例
+    plugin.config["min_idle_minutes"] = 0
+    plugin.config["cooldown_minutes"] = 0
+    plugin.config["max_daily_messages"] = 3
+    plugin.config["max_proactive_per_tick"] = 3
+    plugin.config["private_min_idle_minutes"] = 0
+    plugin.config["private_cooldown_minutes"] = 0
+    plugin.config["private_max_daily_messages"] = 0
+    plugin.config["private_skip_atmosphere"] = True
+    plugin.config["private_priority"] = True
 
     shutil.rmtree(tmp, ignore_errors=True)
 

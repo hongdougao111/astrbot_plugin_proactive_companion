@@ -130,7 +130,11 @@ def build_prompt(
             "并且不要假装对方正在和你对话。"
         )
     else:
-        parts.append("这是一对一的私聊，请像朋友一样自然地搭话。")
+        parts.append(
+            "这是一对一的私聊，只有对方在跟你说话，可以比群里更随意一点："
+            "像真人找朋友聊天那样自然，可以顺着他之前说过的话接，"
+            "也可以关心一下对方最近怎么样，但别追问敏感话题，也别显得查户口。"
+        )
     if context_block:
         parts.append("以下是最近的对话记录（可能为空）：\n" + context_block)
     parts.append(

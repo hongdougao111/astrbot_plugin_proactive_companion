@@ -71,6 +71,13 @@ SAFE_DEFAULTS: dict[str, Any] = {
     "group_enabled": True,
     "private_enabled": True,
     "mention_only_in_group": False,
+    # 私聊专属阈值：默认比全局更主动，设为 0 / 留空则回退到全局配置
+    "private_min_idle_minutes": 15,
+    "private_cooldown_minutes": 60,
+    "private_max_daily_messages": 10,
+    "private_quiet_hours": [],
+    "private_skip_atmosphere": True,
+    "private_priority": True,
     "mood_enabled": True,
     "mood_decay_per_hour": 0.15,
     "mood_affect_frequency": True,
@@ -1076,8 +1083,8 @@ class ProactiveCompanionPlugin(Star):
         now = time.time()
         max_per_tick = max(1, self._cfg_int("max_proactive_per_tick", 3))
         sent_count = 0
-        # 打乱顺序，避免每次都从同一个会话开始，造成规律性打扰
-        random.shuffle(sessions)
+        # 私聊优先、群聊随后，各自内部随机打散
+        sessions = self._order_sessions(sessions)
         for session in sessions:
             if sent_count >= max_per_tick:
                 break
@@ -1102,12 +1109,14 @@ class ProactiveCompanionPlugin(Star):
             return False
 
         chat_type = str(session.get("chat_type") or "")
+        is_private = chat_type == "private"
         if chat_type == "group" and not self._cfg_bool("group_enabled", True):
             return False
-        if chat_type == "private" and not self._cfg_bool("private_enabled", True):
+        if is_private and not self._cfg_bool("private_enabled", True):
             return False
 
-        quiet = self._cfg_list("quiet_hours", [])
+        limits = self._effective_limits(chat_type)
+        quiet = limits["quiet_hours"]
         if dnd.in_quiet_hours(_dt.datetime.now(), quiet):
             return False
 
@@ -1119,7 +1128,7 @@ class ProactiveCompanionPlugin(Star):
             await self.store.update_session(
                 session_key, daily_count=0, daily_date=today
             )
-        max_daily = self._cfg_int("max_daily_messages", 6)
+        max_daily = int(limits["max_daily"])
         if max_daily > 0 and daily_count >= max_daily:
             return False
 
@@ -1127,11 +1136,16 @@ class ProactiveCompanionPlugin(Star):
         last_proactive_at = float(session.get("last_proactive_at") or 0.0)
         anchor = max(last_msg_at, last_proactive_at)
 
-        min_idle = self._idle_threshold_minutes()
+        base_idle = float(limits["min_idle"])
+        min_idle = self._idle_threshold_minutes(base_idle)
         idle_minutes = (now - anchor) / 60.0 if anchor else 0.0
-        # 读空气：群正热闹或气氛紧张时不要硬插话
+        # 读空气：群正热闹或气氛紧张时不要硬插话。
+        # 私聊是两个人的对话，气氛判定本来就没意义（还可能因为一句气话被判成「紧张」，
+        # 结果私聊里彻底闭嘴），所以默认不套用群气氛规则。
+        skip_atmosphere = is_private and self._cfg_bool("private_skip_atmosphere", True)
+        # 气氛数据照常刷新（面板要显示），但私聊不用它当门控
         state = self._atmosphere_of(session_key)
-        if state is not None:
+        if state is not None and not skip_atmosphere:
             if not atmosphere.allow_proactive_message(state):
                 return False
             if state.level == atmosphere.LEVEL_COLD:
@@ -1140,7 +1154,8 @@ class ProactiveCompanionPlugin(Star):
         if idle_minutes < min_idle:
             return False
 
-        cooldown = self._cfg_int("cooldown_minutes", 180)
+        cooldown = int(limits["cooldown"])
+
         if last_proactive_at and (now - last_proactive_at) / 60.0 < cooldown:
             return False
 
@@ -1187,9 +1202,57 @@ class ProactiveCompanionPlugin(Star):
         )
         return True
 
-    def _idle_threshold_minutes(self) -> float:
+    def _order_sessions(self, sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """调度顺序：私聊优先，其次群聊；每一类内部随机打散。
+
+        私聊只有一个人等着回话，应该优先占用本轮发言名额；打散是为了避免
+        每次都从同一个会话开始，形成规律性的打扰。
+        """
+        random.shuffle(sessions)
+        if not self._cfg_bool("private_priority", True):
+            return sessions
+        private = [s for s in sessions if str(s.get("chat_type") or "") == "private"]
+        others = [s for s in sessions if str(s.get("chat_type") or "") != "private"]
+        random.shuffle(private)
+        random.shuffle(others)
+        return private + others
+
+    def _effective_limits(self, chat_type: str) -> dict[str, Any]:
+        """按会话类型算出**实际生效**的阈值。
+
+        私聊有自己的一套默认值（比群里更主动），对应的配置项设为 0 / 留空时
+        自动回退到全局设置，因此群聊行为完全不受影响。
+        """
+        is_private = chat_type == "private"
+        max_daily = self._cfg_int("max_daily_messages", 6)
+        base_idle = float(self._cfg_int("min_idle_minutes", 45))
+        cooldown = self._cfg_int("cooldown_minutes", 180)
+        quiet = self._cfg_list("quiet_hours", [])
+        if is_private:
+            private_daily = self._cfg_int("private_max_daily_messages", 10)
+            if private_daily > 0:
+                max_daily = private_daily
+            private_idle = self._cfg_int("private_min_idle_minutes", 15)
+            if private_idle > 0:
+                base_idle = float(private_idle)
+            private_cooldown = self._cfg_int("private_cooldown_minutes", 60)
+            if private_cooldown > 0:
+                cooldown = private_cooldown
+            private_quiet = self._cfg_list("private_quiet_hours", [])
+            if private_quiet:
+                quiet = private_quiet
+        return {
+            "max_daily": max_daily,
+            "min_idle": base_idle,
+            "cooldown": cooldown,
+            "quiet_hours": quiet,
+        }
+
+    def _idle_threshold_minutes(self, base: float | None = None) -> float:
         """静默阈值，带随机抖动，避免所有会话在同一时刻一起触发。"""
-        base = float(self._cfg_int("min_idle_minutes", 45))
+        if base is None:
+            base = float(self._cfg_int("min_idle_minutes", 45))
+        base = float(base)
         ratio = max(0.0, self._cfg_float("idle_jitter_ratio", 0.2))
         if base <= 0 or ratio <= 0:
             return base
@@ -1400,18 +1463,23 @@ class ProactiveCompanionPlugin(Star):
         last_text = (
             time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "还没有"
         )
-        quiet = self._cfg_list("quiet_hours", [])
+        chat_type = str(session.get("chat_type") or self._chat_type(event))
+        limits = self._effective_limits(chat_type)
+        quiet = limits["quiet_hours"]
         dnd_state = (
             "免打扰中" if dnd.in_quiet_hours(_dt.datetime.now(), quiet) else "可打扰"
         )
+        scope_text = "私聊" if chat_type == "private" else "群聊"
         text = (
             f"主动陪伴状态：{'开启' if int(session.get('enabled') or 0) else '关闭'}\n"
             f"当前情绪：{emotion.label_for(mood)}"
             f"（{mood.valence:+.2f} / {mood.arousal:.2f}）\n"
             f"已发送：{int(session.get('messages_sent') or 0)} 条，"
-            f"今日：{int(session.get('daily_count') or 0)}/{self._cfg_int('max_daily_messages', 6)}\n"
+            f"今日：{int(session.get('daily_count') or 0)}/{limits['max_daily']}\n"
             f"上次主动：{last_text}\n"
-            f"时段状态：{dnd_state}"
+            f"时段状态：{dnd_state}\n"
+            f"{scope_text}阈值：静默 {int(limits['min_idle'])} 分钟 / "
+            f"间隔 {int(limits['cooldown'])} 分钟"
         )
         yield event.plain_result(text)
 
@@ -2328,6 +2396,8 @@ class ProactiveCompanionPlugin(Star):
                 "sent_today": sent_today,
                 "quiet_hours": quiet,
                 "in_quiet_hours": dnd.in_quiet_hours(_dt.datetime.now(), quiet),
+                "private_limits": self._effective_limits("private"),
+                "group_limits": self._effective_limits("group"),
                 "next_available": (
                     dnd.next_active_time(_dt.datetime.now(), quiet).isoformat()
                     if dnd.in_quiet_hours(_dt.datetime.now(), quiet)

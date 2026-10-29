@@ -105,6 +105,12 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 | `atmosphere_boost` | `1.5` | 冷场时主动回复概率的放大倍数 |
 | `affection_enabled` | `true` | 启用好感度（长期关系） |
 | `group_enabled` / `private_enabled` | `true` | 是否允许在群聊 / 私聊主动发言 |
+| `private_min_idle_minutes` | `15` | 私聊里对方静默多久就主动开口（0 = 跟随全局） |
+| `private_cooldown_minutes` | `60` | 私聊两次主动发言的最小间隔（0 = 跟随全局） |
+| `private_max_daily_messages` | `10` | 私聊每日上限（0 = 跟随全局） |
+| `private_quiet_hours` | `[]` | 私聊专属免打扰时段，留空 = 跟随全局 |
+| `private_skip_atmosphere` | `true` | 私聊不看群聊气氛规则（两人对话更敢说话） |
+| `private_priority` | `true` | 每轮名额有限时优先照顾私聊 |
 | `mention_only_in_group` | `false` | 群里只有被 @ 过才主动说话 |
 | `mood_enabled` | `true` | 是否启用动态情绪 |
 | `mood_decay_per_hour` | `0.15` | 情绪回归平静的速度 |
@@ -144,9 +150,31 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 python tests/test_proactive_companion.py
 ```
 
-当前结果：**211 项断言全部通过**（另有一份发布前体检脚本，覆盖 73 项市场规范/配置类型/包内容检查）。
+当前结果：**231 项断言全部通过**（另有一份发布前体检脚本，覆盖 80 项市场规范/配置类型/包内容检查）。
 
 ## 📋 更新日志
+
+### v1.1.0
+
+- **私聊更主动**：私聊场景有一套独立、明显更积极的默认阈值，群里行为完全不变。
+
+  | 阈值 | 群聊 | 私聊（新增） |
+  | --- | --- | --- |
+  | 静默多久才主动开口 | 45 分钟 | **15 分钟** |
+  | 两次主动发言最小间隔 | 180 分钟 | **60 分钟** |
+  | 每日主动消息上限 | 6 条 | **10 条** |
+
+- **私聊不再被群聊的气氛规则卡住**（`private_skip_atmosphere`，默认开启）。
+  「冷清 / 热闹 / 紧张」是按多人聊天设计的，用在两个人私聊上容易误伤——
+  比如对方一句气话被判成「紧张」，Bot 就在私聊里彻底闭嘴。现在私聊不看气氛。
+- **私聊有专属免打扰时段**（`private_quiet_hours`）：可以只让私聊在深夜安静，
+  群聊照旧；留空则沿用全局免打扰时段。
+- **私聊优先发言**（`private_priority`，默认开启）：每轮主动发言名额有限时，
+  优先给等着回话的私聊会话，群聊随后。
+- 以上私聊阈值都可以在面板「配置」页调整，**全部填 0 / 留空即回退到全局设置**，
+  想让私聊跟群聊一样保守，把它们清零即可。
+- `/陪伴 状态` 现在会显示当前场景实际生效的阈值（静默 / 间隔 / 每日上限）。
+- 私聊主动消息的提示词改为更口语化的一对一引导，不再端着。
 
 ### v1.0.9
 
