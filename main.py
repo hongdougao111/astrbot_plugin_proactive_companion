@@ -89,6 +89,7 @@ SAFE_DEFAULTS: dict[str, Any] = {
     "system_prompt": generator.DEFAULT_SYSTEM_PROMPT,
     "max_context_messages": 12,
     "keep_messages_per_session": 200,
+    "keep_messages_days": 30,
     "keep_events": 1000,
     "proactive_reply_enabled": True,
     "proactive_reply_probability": 0.2,
@@ -1027,6 +1028,17 @@ class ProactiveCompanionPlugin(Star):
                 )
         await self.store.update_session(umo, **update)
 
+        # 写完立刻裁剪本会话的旧记录，这样「每会话保留消息数」改完马上生效，
+        # 不必等定时任务跑一轮（数据库也不会被旧聊天撑大）。
+        try:
+            keep = max(10, self._cfg_int("keep_messages_per_session", 200))
+            await self.store.prune_session_messages(umo, keep)
+            await self.store.prune_session_messages_by_age(
+                umo, self._cfg_int("keep_messages_days", 30)
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"[主动陪伴] 裁剪会话消息失败: {exc}")
+
         if content and self._cfg_bool("mood_enabled", True):
             await self._apply_mood_event(umo, content)
 
@@ -1424,6 +1436,12 @@ class ProactiveCompanionPlugin(Star):
             await self.store.prune_messages(
                 max(10, self._cfg_int("keep_messages_per_session", 200))
             )
+            # 按保留天数清理过期聊天记录（0 = 永不按时间清理）
+            removed = await self.store.prune_messages_by_age(
+                self._cfg_int("keep_messages_days", 30)
+            )
+            if removed:
+                logger.info(f"[主动陪伴] 已清理 {removed} 条过期聊天记录")
             await self.store.prune_events(max(50, self._cfg_int("keep_events", 1000)))
         except Exception as exc:  # pragma: no cover
             logger.warning(f"[主动陪伴] 清理历史数据失败: {exc}")
@@ -1736,6 +1754,9 @@ class ProactiveCompanionPlugin(Star):
             f"总长 ≤{self._cfg_int('context_max_chars', 1200)} 字，"
             f"屏蔽词 {'、'.join(str(k) for k in self._cfg_list('context_blocked_keywords', [])) or '无'}）",
             f"本会话注入：{'已熔断' if await self._context_inject_disabled(umo) else '正常'}",
+            f"聊天记录保存：每会话 ≤{self._cfg_int('keep_messages_per_session', 200)} 条，"
+            f"{self._cfg_int('keep_messages_days', 30)} 天"
+            f"（0 = 不按时间清理）",
             f"最近判定：{self._last_reply_decision}",
         ]
         if self._reply_skip_reasons:

@@ -345,6 +345,58 @@ class Store:
 
         await self._run(_do)
 
+    async def prune_session_messages(self, session_key: str, keep: int = 200) -> None:
+        """只裁剪某一个会话的旧消息，让「保存多少条」改完立刻生效。
+
+        与 :meth:`prune_messages`（全量扫描所有会话，适合定时任务）的区别：
+        这里只针对刚写入消息的那个会话，开销小，可以在每次写消息后调用。
+        """
+
+        def _do(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "DELETE FROM messages WHERE session_key = ? AND id NOT IN ("
+                "SELECT id FROM messages WHERE session_key = ?"
+                " ORDER BY id DESC LIMIT ?)",
+                (session_key, session_key, keep),
+            )
+
+        await self._run(_do)
+
+    async def prune_messages_by_age(self, keep_days: int = 30) -> int:
+        """删除超过保留天数的聊天记录，返回删除条数。
+
+        与 :meth:`prune_messages`（按条数）互补：条数管「每个会话留多少」，
+        天数管「最多留多久」。keep_days <= 0 表示不按时间清理。
+        """
+
+        if keep_days <= 0:
+            return 0
+        cutoff = time.time() - keep_days * 86400
+
+        def _do(conn: sqlite3.Connection) -> int:
+            cur = conn.execute("DELETE FROM messages WHERE ts < ?", (cutoff,))
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        return await self._run(_do)
+
+    async def prune_session_messages_by_age(
+        self, session_key: str, keep_days: int = 30
+    ) -> int:
+        """删除某个会话里超过保留天数的消息（写消息后调用，即时生效）。"""
+
+        if keep_days <= 0:
+            return 0
+        cutoff = time.time() - keep_days * 86400
+
+        def _do(conn: sqlite3.Connection) -> int:
+            cur = conn.execute(
+                "DELETE FROM messages WHERE session_key = ? AND ts < ?",
+                (session_key, cutoff),
+            )
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        return await self._run(_do)
+
     # ------------------------------------------------------------------
     # 事件日志
     # ------------------------------------------------------------------

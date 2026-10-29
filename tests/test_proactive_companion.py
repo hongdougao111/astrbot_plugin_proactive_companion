@@ -2217,6 +2217,88 @@ async def main() -> None:
     plugin.config["context_blocked_keywords"] = []
     plugin.config["context_injection_enabled"] = True
 
+    print("\n== 29. 聊天记录保存条数与保留天数 ==")
+    keep_umo = "grp:keep_test"
+
+    # 29.1 写入后立即按条数裁剪（不需要等定时任务）
+    plugin.config["keep_messages_per_session"] = 10
+    plugin.config["keep_messages_days"] = 0
+    for i in range(15):
+        await plugin.store.add_message(keep_umo, "user", f"第{i}条", "甲", "u-keep")
+        await plugin.store.prune_session_messages(keep_umo, 10)
+    kept = await plugin.store.recent_messages(keep_umo, 100)
+    check(
+        "写入后立即按条数裁剪",
+        len(kept) == 10,
+        f"实际 {len(kept)} 条",
+    )
+    check(
+        "裁剪后保留的是最近的记录",
+        kept[-1]["content"] == "第14条",
+        str(kept[-1] if kept else None),
+    )
+
+    # 29.2 超过保留天数的记录会被清掉
+    old_ts = time.time() - 40 * 86400
+    await plugin.store.add_message(
+        keep_umo, "user", "很久以前", "甲", "u-keep", ts=old_ts
+    )
+    removed = await plugin.store.prune_session_messages_by_age(keep_umo, 30)
+    check("按天数清理过期记录", removed == 1, f"删除 {removed} 条")
+    check(
+        "过期记录已被删除",
+        all(
+            m["content"] != "很久以前"
+            for m in await plugin.store.recent_messages(keep_umo, 100)
+        ),
+    )
+
+    # 29.3 天数为 0 时不按时间清理
+    await plugin.store.add_message(
+        keep_umo, "user", "更久以前", "甲", "u-keep", ts=old_ts
+    )
+    removed0 = await plugin.store.prune_session_messages_by_age(keep_umo, 0)
+    check(
+        "天数为 0 时不清理",
+        removed0 == 0
+        and any(
+            m["content"] == "更久以前"
+            for m in await plugin.store.recent_messages(keep_umo, 100)
+        ),
+        f"删除 {removed0} 条",
+    )
+
+    # 29.4 全局按天数清理
+    removed_all = await plugin.store.prune_messages_by_age(30)
+    check(
+        "全局按天数清理",
+        removed_all >= 1
+        and all(
+            m["content"] != "更久以前"
+            for m in await plugin.store.recent_messages(keep_umo, 100)
+        ),
+        f"删除 {removed_all} 条",
+    )
+    check(
+        "全局天数为 0 时不清理",
+        await plugin.store.prune_messages_by_age(0) == 0,
+    )
+
+    # 29.5 诊断里能看到当前生效的保存设置
+    plugin.config["keep_messages_per_session"] = 120
+    plugin.config["keep_messages_days"] = 15
+    diag = await mock_await_result(
+        plugin.companion_diagnose(MockEvent(keep_umo, "陪伴 诊断"))
+    )
+    check(
+        "诊断显示聊天记录保存设置",
+        diag is not None and "聊天记录保存" in diag[1] and "120" in diag[1],
+        str(diag),
+    )
+
+    plugin.config["keep_messages_per_session"] = 200
+    plugin.config["keep_messages_days"] = 30
+
     shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n" + "=" * 52)

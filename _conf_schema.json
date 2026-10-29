@@ -170,10 +170,16 @@
     "hint": "生成主动消息时参考的最近消息条数。"
   },
   "keep_messages_per_session": {
-    "description": "每会话保留的消息条数",
+    "description": "聊天记录保存条数（每个会话）",
     "type": "int",
     "default": 200,
-    "hint": "超出后自动清理旧消息，避免数据库膨胀。"
+    "hint": "每个会话最多保留多少条聊天记录，超出的旧记录会自动删除；保存新消息后立即生效，不用重启插件。调小可以减少数据库体积，也减少被 LLM 安全审核误拦的概率。"
+  },
+  "keep_messages_days": {
+    "description": "聊天记录保留天数",
+    "type": "int",
+    "default": 30,
+    "hint": "超过这个天数的聊天记录会自动删除；填 0 表示永不按时间清理。条数与天数同时生效，谁先到谁先删。"
   },
   "keep_events": {
     "description": "保留的事件日志条数",

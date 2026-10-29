@@ -40,7 +40,20 @@ const CONFIG_FIELDS = [
   { key: "tts_send_text", label: "语音同时发送文本", type: "bool" },
   { key: "tts_max_chars", label: "TTS 文本长度上限", type: "int", min: 0 },
   { key: "max_context_messages", label: "上下文消息条数", type: "int", min: 1 },
-  { key: "keep_messages_per_session", label: "每会话保留消息数", type: "int", min: 10 },
+  { key: "keep_messages_per_session", label: "聊天记录保存条数（每会话）", type: "select", options: [
+    { value: 50, label: "50 条（最省）" },
+    { value: 100, label: "100 条" },
+    { value: 200, label: "200 条（默认）" },
+    { value: 500, label: "500 条" },
+    { value: 1000, label: "1000 条" },
+  ], hint: "每个会话最多保留这么多条聊天记录，超出的自动删除；改完立即生效" },
+  { key: "keep_messages_days", label: "聊天记录保留天数", type: "select", options: [
+    { value: 0, label: "永不按时间清理" },
+    { value: 7, label: "7 天" },
+    { value: 30, label: "30 天（默认）" },
+    { value: 90, label: "90 天" },
+    { value: 180, label: "180 天" },
+  ], hint: "超过这个天数的聊天记录自动删除；与条数同时生效，谁先到谁先删" },
   { key: "keep_events", label: "保留事件日志条数", type: "int", min: 50 },
   { key: "proactive_reply_enabled", label: "启用主动回复", type: "bool" },
   { key: "proactive_reply_probability", label: "主动回复概率 (0.0-1.0)", type: "float", min: 0 },
@@ -376,6 +389,21 @@ async function loadConfig() {
       control = `<div class="switch"><input type="checkbox" id="${id}" data-key="${f.key}" data-type="bool" ${value ? "checked" : ""} /><span>${value ? "已开启" : "已关闭"}</span></div>`;
     } else if (f.type === "textarea") {
       control = `<textarea id="${id}" data-key="${f.key}" data-type="text">${esc(value ?? "")}</textarea>`;
+    } else if (f.type === "select") {
+      const opts = (f.options || []).slice();
+      // 当前值不在预设里时，补一个「自定义」选项，避免保存时被第一项悄悄覆盖
+      const known = opts.some((o) => String(typeof o === "object" ? o.value : o) === String(value));
+      if (value !== undefined && value !== null && value !== "" && !known) {
+        opts.push({ value: value, label: `自定义（${value}）` });
+      }
+      const html = opts
+        .map((o) => {
+          const val = typeof o === "object" ? o.value : o;
+          const label = typeof o === "object" ? o.label : o;
+          return `<option value="${esc(val)}" ${String(value) === String(val) ? "selected" : ""}>${esc(label)}</option>`;
+        })
+        .join("");
+      control = `<select id="${id}" data-key="${f.key}" data-type="int">${html}</select>`;
     } else if (f.list) {
       const arr = Array.isArray(value) ? value.join(", ") : value ?? "";
       control = `<input type="text" id="${id}" data-key="${f.key}" data-type="list" value="${esc(arr)}" />`;
