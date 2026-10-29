@@ -2011,6 +2011,66 @@ async def main() -> None:
     plugin.config["private_skip_atmosphere"] = True
     plugin._atmosphere_cache.pop(tense_umo, None)
 
+    # 27.9 私聊主动搭话白名单
+    wl_umo = "aiocqhttp:FriendMessage:wl1"
+    await plugin.store.ensure_session(
+        wl_umo, wl_umo, "aiocqhttp", "private", "私聊白名单"
+    )
+    await plugin.store.update_session(wl_umo, enabled=1)
+    await plugin.store.add_message(wl_umo, "user", "在吗", "小白", "u-wl")
+
+    # 白名单为空 = 不限制
+    plugin.config["private_proactive_whitelist"] = []
+    check(
+        "白名单为空时放行",
+        await plugin._private_whitelisted({"session_key": wl_umo, "umo": wl_umo}),
+    )
+
+    # 白名单里是别人 → 该私聊保持安静
+    plugin.config["private_proactive_whitelist"] = ["u-other"]
+    check(
+        "非白名单用户不放行",
+        not await plugin._private_whitelisted({"session_key": wl_umo, "umo": wl_umo}),
+    )
+    plugin.config["max_daily_messages"] = 50
+    plugin.config["max_proactive_per_tick"] = 50
+    ctx.sent.clear()
+    await plugin.tick()
+    check(
+        "非白名单用户的私聊不会被主动搭话",
+        len(ctx.sent_to(wl_umo)) == 0,
+        f"sent={len(ctx.sent_to(wl_umo))}",
+    )
+
+    # 白名单里是对方用户 ID → 放行
+    plugin.config["private_proactive_whitelist"] = ["u-wl"]
+    check(
+        "白名单命中用户 ID 放行",
+        await plugin._private_whitelisted({"session_key": wl_umo, "umo": wl_umo}),
+    )
+    ctx.sent.clear()
+    await plugin.tick()
+    check(
+        "白名单用户的私聊会被主动搭话",
+        len(ctx.sent_to(wl_umo)) == 1,
+        f"sent={len(ctx.sent_to(wl_umo))}",
+    )
+
+    # 白名单里是昵称 → 同样放行
+    plugin.config["private_proactive_whitelist"] = ["小白"]
+    check(
+        "白名单命中昵称放行",
+        await plugin._private_whitelisted({"session_key": wl_umo, "umo": wl_umo}),
+    )
+
+    # `*` = 不限制
+    plugin.config["private_proactive_whitelist"] = ["*"]
+    check(
+        "星号表示不限制",
+        await plugin._private_whitelisted({"session_key": wl_umo, "umo": wl_umo}),
+    )
+    plugin.config["private_proactive_whitelist"] = []
+
     # 恢复默认，避免影响其它用例
     plugin.config["min_idle_minutes"] = 0
     plugin.config["cooldown_minutes"] = 0

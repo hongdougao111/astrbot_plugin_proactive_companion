@@ -78,6 +78,7 @@ SAFE_DEFAULTS: dict[str, Any] = {
     "private_quiet_hours": [],
     "private_skip_atmosphere": True,
     "private_priority": True,
+    "private_proactive_whitelist": [],
     "mood_enabled": True,
     "mood_decay_per_hour": 0.15,
     "mood_affect_frequency": True,
@@ -1114,6 +1115,8 @@ class ProactiveCompanionPlugin(Star):
             return False
         if is_private and not self._cfg_bool("private_enabled", True):
             return False
+        if is_private and not await self._private_whitelisted(session):
+            return False
 
         limits = self._effective_limits(chat_type)
         quiet = limits["quiet_hours"]
@@ -1216,6 +1219,40 @@ class ProactiveCompanionPlugin(Star):
         random.shuffle(private)
         random.shuffle(others)
         return private + others
+
+    async def _private_whitelisted(self, session: dict[str, Any]) -> bool:
+        """私聊主动搭话白名单。
+
+        - 留空（或填 `*`）= 不限制，任何人的私聊都可以被主动搭话；
+        - 填了具体值之后，**只有命中的人**的私聊才会被主动搭话，其余人的私聊
+          保持安静（群聊完全不受影响）。
+
+        可填：对方用户 ID、昵称、会话 ID（umo）。昵称按「手动昵称 > 平台昵称」
+        取最新那个，所以改了昵称也不会失效。
+        """
+        whitelist = [
+            str(item).strip()
+            for item in self._cfg_list("private_proactive_whitelist", [])
+            if str(item).strip()
+        ]
+        if not whitelist or "*" in whitelist:
+            return True
+        session_key = str(session.get("session_key") or "")
+        candidates: set[str] = {
+            session_key,
+            str(session.get("umo") or ""),
+        }
+        try:
+            names, peer_id, peer_name = await self._nickname_context(session_key)
+        except Exception:  # pragma: no cover
+            names, peer_id, peer_name = {}, "", ""
+        if peer_id:
+            candidates.add(peer_id)
+        if peer_name:
+            candidates.add(peer_name)
+        candidates.update(str(uid) for uid in names)
+        lowered = {item.lower() for item in candidates if item}
+        return any(item in candidates or item.lower() in lowered for item in whitelist)
 
     def _effective_limits(self, chat_type: str) -> dict[str, Any]:
         """按会话类型算出**实际生效**的阈值。
@@ -1481,6 +1518,9 @@ class ProactiveCompanionPlugin(Star):
             f"{scope_text}阈值：静默 {int(limits['min_idle'])} 分钟 / "
             f"间隔 {int(limits['cooldown'])} 分钟"
         )
+        if chat_type == "private":
+            wl = self._cfg_list("private_proactive_whitelist", [])
+            text += f"\n私聊白名单：{'、'.join(str(w) for w in wl) if wl else '（未设置 = 不限制）'}"
         yield event.plain_result(text)
 
     @filter.permission_type(filter.PermissionType.ADMIN)

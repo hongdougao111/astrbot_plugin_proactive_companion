@@ -111,6 +111,7 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 | `private_quiet_hours` | `[]` | 私聊专属免打扰时段，留空 = 跟随全局 |
 | `private_skip_atmosphere` | `true` | 私聊不看群聊气氛规则（两人对话更敢说话） |
 | `private_priority` | `true` | 每轮名额有限时优先照顾私聊 |
+| `private_proactive_whitelist` | `[]` | 私聊主动搭话白名单，留空 = 不限制；填用户 ID / 昵称 / 会话 ID 后只有命中的人被主动搭话 |
 | `mention_only_in_group` | `false` | 群里只有被 @ 过才主动说话 |
 | `mood_enabled` | `true` | 是否启用动态情绪 |
 | `mood_decay_per_hour` | `0.15` | 情绪回归平静的速度 |
@@ -150,9 +151,19 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 python tests/test_proactive_companion.py
 ```
 
-当前结果：**231 项断言全部通过**（另有一份发布前体检脚本，覆盖 80 项市场规范/配置类型/包内容检查）。
+当前结果：**238 项断言全部通过**（另有一份发布前体检脚本，覆盖 80 项市场规范/配置类型/包内容检查）。
 
 ## 📋 更新日志
+
+### v1.2.0
+
+- **私聊也有白名单了**（`私聊主动搭话白名单`）：
+  - **留空 = 不限制**（保持 v1.1.0 的行为，任何人的私聊都可以被主动搭话）。
+  - 填上具体值后，**只有命中的人**的私聊才会被主动搭话，其他人的私聊保持安静。
+  - 可填 **用户 ID / 昵称 / 会话 ID**，昵称取最新昵称（手动昵称优先），改了昵称也不会失效；
+    填 `*` 同样表示不限制。
+  - **群聊完全不受影响** —— 白名单只作用于私聊主动搭话。
+  - 面板「配置」页可直接编辑，`/陪伴 状态` 在私聊里会显示当前白名单。
 
 ### v1.1.0
 

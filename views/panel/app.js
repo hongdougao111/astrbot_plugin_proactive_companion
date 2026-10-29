@@ -30,6 +30,7 @@ const CONFIG_FIELDS = [
   { key: "private_quiet_hours", label: "私聊·免打扰时段", type: "text", list: true, hint: "留空 = 跟随全局；如 23:30-08:00" },
   { key: "private_skip_atmosphere", label: "私聊不受气氛规则限制", type: "bool", hint: "两人对话不套用群聊的「冷清/热闹/紧张」判定" },
   { key: "private_priority", label: "私聊优先发言", type: "bool", hint: "每轮名额有限时优先给私聊" },
+  { key: "private_proactive_whitelist", label: "私聊主动搭话白名单", type: "text", list: true, hint: "留空 = 不限制；填用户 ID / 昵称 / 会话 ID，只有命中的人私聊才被主动搭话" },
   { key: "mention_only_in_group", label: "群聊仅被 @ 后发言", type: "bool" },
   { key: "mood_enabled", label: "启用动态情绪", type: "bool" },
   { key: "mood_decay_per_hour", label: "情绪衰减速度 / 小时", type: "float", min: 0 },

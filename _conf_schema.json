@@ -99,6 +99,15 @@
     "default": true,
     "hint": "每轮主动发言名额有限时，优先照顾私聊会话。"
   },
+  "private_proactive_whitelist": {
+    "description": "私聊主动搭话白名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "留空 = 不限制（任何人的私聊都可以被主动搭话）。填写用户 ID、昵称或会话 ID 后，只有命中的人才会在私聊里被主动搭话，其余人的私聊保持安静；群聊不受影响。昵称按最新昵称匹配，改了昵称也有效。"
+  },
   "mention_only_in_group": {
     "description": "群聊中仅在被 @ 后才主动发言",
     "type": "bool",
