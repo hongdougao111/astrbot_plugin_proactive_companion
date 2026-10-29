@@ -151,9 +151,26 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 python tests/test_proactive_companion.py
 ```
 
-当前结果：**238 项断言全部通过**（另有一份发布前体检脚本，覆盖 80 项市场规范/配置类型/包内容检查）。
+当前结果：**257 项断言全部通过**（另有一份发布前体检脚本，覆盖市场规范/配置类型/包内容检查）。
 
 ## 📋 更新日志
+
+### v1.2.1
+
+- **修复群聊「All chat models failed / input new_sensitive」**：插件会把群聊近期对话补进
+  模型请求，一旦其中一句被网关判为敏感，之后**每一次**带上它的请求都会被拦，
+  群里就再也回不上话。新增两道保险：
+  - **上下文注入护栏**（面板「配置」页可调）：
+    - `context_blocked_keywords`：屏蔽词，命中的消息**整条丢弃**（默认空 = 不拦任何词）。
+    - `context_max_message_chars`：单条消息长度上限，超出自动截断（默认 200）。
+    - `context_max_chars`：注入上下文总长度上限，超出保留最近内容（默认 1200）。
+  - **自动熔断**：捕捉到 `All chat models failed` / `sensitive` / `content_filter` 这类
+    拦截错误时，自动**停止该会话的上下文注入**，群里立刻恢复正常，不再连锁失败；
+    同时记录一条 `llm_input_rejected` 事件方便排查。
+- **新增指令 `/陪伴 上下文`**（别名 `context` / `ctx`）：查看状态、`暂停`、`恢复`。
+  也可在面板一键关闭「启用上下文注入」。
+- 原始聊天记录**不会被删除**，随时 `/陪伴 上下文 恢复` 重新开启。
+- `/陪伴 诊断` 新增上下文注入开关、长度上限、屏蔽词与本会话熔断状态。
 
 ### v1.2.0
 

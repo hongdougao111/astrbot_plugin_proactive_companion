@@ -1522,7 +1522,7 @@ async def main() -> None:
 
     # 23.6 指令仅限管理员使用
     cmds = getattr(plugin.companion, "commands", {})
-    check("指令组下有 11 条子指令", len(cmds) == 11, str(sorted(cmds)))
+    check("指令组下有 12 条子指令", len(cmds) == 12, str(sorted(cmds)))
     non_admin = [
         name
         for name, func in cmds.items()
@@ -2081,6 +2081,141 @@ async def main() -> None:
     plugin.config["private_max_daily_messages"] = 0
     plugin.config["private_skip_atmosphere"] = True
     plugin.config["private_priority"] = True
+
+    print("\n== 28. 上下文注入护栏与自动熔断 ==")
+    # 28.1 单条消息超长会被截断
+    plugin.config["context_max_message_chars"] = 10
+    plugin.config["context_blocked_keywords"] = []
+    long_msgs = [{"content": "啊" * 50, "role": "user", "sender": "甲"}]
+    trimmed = plugin._sanitize_messages(long_msgs)
+    check("超长消息被截断", len(trimmed[0]["content"]) == 11, str(trimmed))
+    check(
+        "截断后保留开头",
+        trimmed[0]["content"].startswith("啊啊啊啊啊啊"),
+        trimmed[0]["content"],
+    )
+
+    # 28.2 命中屏蔽词的消息整条丢弃
+    plugin.config["context_blocked_keywords"] = ["违禁"]
+    filtered = plugin._sanitize_messages(
+        [
+            {"content": "普通消息", "role": "user", "sender": "甲"},
+            {"content": "这里有违禁内容", "role": "user", "sender": "乙"},
+        ]
+    )
+    check("命中屏蔽词的消息被丢弃", len(filtered) == 1, str(filtered))
+    check("保留的是没命中的那条", filtered[0]["content"] == "普通消息", str(filtered))
+    plugin.config["context_blocked_keywords"] = []
+
+    # 28.3 注入总长上限
+    plugin.config["context_max_chars"] = 200
+    plugin.config["context_max_message_chars"] = 200
+    many = [
+        {"content": f"第{i}条消息内容", "role": "user", "sender": f"u{i}"}
+        for i in range(50)
+    ]
+    block = plugin._format_context_block(many, "", {}, "")
+    body = block.split("<chat_context>")[1].split("</chat_context>")[0]
+    check("注入总长被限制", len(body) <= 260, f"len={len(body)}")
+
+    # 28.4 LLM 输入被拦的错误能被识别
+    check(
+        "识别 All chat models failed",
+        plugin._looks_like_llm_rejection(
+            "LLM 响应错误: All chat models failed: InternalServerError: 500 - "
+            "{'error': {'message': 'input new_sensitive (1026)'}}"
+        ),
+    )
+    check(
+        "识别 sensitive 关键词",
+        plugin._looks_like_llm_rejection("input new_sensitive (1026)"),
+    )
+    check(
+        "普通回复不被误判",
+        not plugin._looks_like_llm_rejection("今天天气不错呀"),
+    )
+
+    # 28.5 出现拦截错误时自动熔断该会话的上下文注入
+    guard_umo = "aiocqhttp:GroupMessage:guard"
+    await plugin.store.ensure_session(
+        guard_umo, guard_umo, "aiocqhttp", "group", "护栏群"
+    )
+    await plugin.store.update_session(guard_umo, enabled=1)
+    check(
+        "初始未熔断",
+        not await plugin._context_inject_disabled(guard_umo),
+    )
+    err_event = MockEvent(guard_umo, "随便说句")
+    err_event.set_result(
+        "LLM 响应错误: All chat models failed: InternalServerError: 500 - "
+        "{'error': {'message': 'input new_sensitive (1026)'}}"
+    )
+    await plugin.capture_turn(err_event)
+    check(
+        "检测到拦截后自动熔断",
+        await plugin._context_inject_disabled(guard_umo),
+    )
+    guard_msgs = await plugin.store.recent_messages(guard_umo, 20)
+    check(
+        "错误提示不会被写进聊天记录",
+        not any(
+            "All chat models failed" in str(m.get("content", "")) for m in guard_msgs
+        ),
+        str(guard_msgs),
+    )
+    check(
+        "错误时不会记录 bot 回复",
+        not any(m.get("role") in ("bot", "proactive") for m in guard_msgs),
+        str(guard_msgs),
+    )
+    events = await plugin.store.recent_events(50)
+    check(
+        "记录了 llm_input_rejected 事件",
+        any(e.get("kind") == "llm_input_rejected" for e in events),
+        str([e.get("kind") for e in events[:5]]),
+    )
+
+    # 28.6 可以手动恢复
+    await plugin._set_context_inject(guard_umo, False)
+    check(
+        "手动恢复后不再熔断",
+        not await plugin._context_inject_disabled(guard_umo),
+    )
+
+    # 28.7 指令可以查看 / 暂停 / 恢复
+    res = await mock_await_result(
+        plugin.companion_context(MockEvent(guard_umo, "陪伴 上下文"))
+    )
+    check("上下文指令有回复", res is not None and "上下文注入状态" in res[1], str(res))
+    res = await mock_await_result(
+        plugin.companion_context(MockEvent(guard_umo, "陪伴 上下文 暂停"))
+    )
+    check(
+        "上下文指令可暂停",
+        res is not None and "已暂停" in res[1],
+        str(res),
+    )
+    check(
+        "暂停后处于熔断状态",
+        await plugin._context_inject_disabled(guard_umo),
+    )
+    res = await mock_await_result(
+        plugin.companion_context(MockEvent(guard_umo, "陪伴 上下文 恢复"))
+    )
+    check(
+        "上下文指令可恢复",
+        res is not None and "已恢复" in res[1],
+        str(res),
+    )
+    check(
+        "恢复后不再熔断",
+        not await plugin._context_inject_disabled(guard_umo),
+    )
+
+    plugin.config["context_max_chars"] = 1200
+    plugin.config["context_max_message_chars"] = 200
+    plugin.config["context_blocked_keywords"] = []
+    plugin.config["context_injection_enabled"] = True
 
     shutil.rmtree(tmp, ignore_errors=True)
 

@@ -273,6 +273,33 @@
     "default": 1.5,
     "hint": "气氛冷清时，主动回复的概率乘以该倍数。"
   },
+  "context_injection_enabled": {
+    "description": "启用上下文注入",
+    "type": "bool",
+    "default": true,
+    "hint": "把插件记录到的聊天记录补进主动接话的 LLM 请求。关闭后 Bot 主动接话将看不到群聊上下文（但仍会正常回复）。"
+  },
+  "context_max_chars": {
+    "description": "注入上下文的总长度上限（字符）",
+    "type": "int",
+    "default": 1200,
+    "hint": "注入内容过长时只保留最近的对话。控制得越小，越不容易触发 LLM 网关的输入安全审核。"
+  },
+  "context_max_message_chars": {
+    "description": "单条消息的注入长度上限（字符）",
+    "type": "int",
+    "default": 200,
+    "hint": "超过长度的消息会被截断后再注入。"
+  },
+  "context_blocked_keywords": {
+    "description": "上下文屏蔽词",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "命中其中任意关键词的消息，整条都不会被注入给模型。用于规避群里那些会被 LLM 网关判为敏感的内容。留空 = 不屏蔽任何词。"
+  },
   "affection_enabled": {
     "description": "启用好感度",
     "type": "bool",

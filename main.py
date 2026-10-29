@@ -98,6 +98,11 @@ SAFE_DEFAULTS: dict[str, Any] = {
     "capture_context_enabled": True,
     "proactive_reply_context_messages": 12,
     "capture_context_max_sessions": 200,
+    # 上下文注入的护栏：防止注入的内容触发 LLM 网关的输入安全拦截
+    "context_injection_enabled": True,
+    "context_max_chars": 1200,
+    "context_max_message_chars": 200,
+    "context_blocked_keywords": [],
     "atmosphere_enabled": True,
     "atmosphere_window_minutes": 30,
     "atmosphere_refresh_minutes": 3,
@@ -409,6 +414,14 @@ class ProactiveCompanionPlugin(Star):
         umo = event.get_extra(_PROACTIVE_SESSION_KEY)
         if not umo or TextPart is None:
             return
+        if not self._cfg_bool("context_injection_enabled", True):
+            return
+        try:
+            # 该会话是否因为「LLM 输入被安全拦截」而自动熔断了上下文注入
+            if await self._context_inject_disabled(umo):
+                return
+        except Exception:  # pragma: no cover
+            pass
         try:
             limit = max(1, self._cfg_int("proactive_reply_context_messages", 12))
             messages = await self.store.recent_messages(umo, limit)
@@ -460,6 +473,76 @@ class ProactiveCompanionPlugin(Star):
             peer_name = names[peer_id]
         return names, peer_id, peer_name
 
+    async def _context_inject_disabled(self, session_key: str) -> bool:
+        """该会话是否已被熔断（不再注入上下文）。"""
+        session = await self.store.get_session(session_key)
+        if not session:
+            return False
+        note = self._load_note(session)
+        return bool(note.get("context_inject_off"))
+
+    async def _set_context_inject(self, session_key: str, disabled: bool) -> None:
+        """设置 / 取消该会话的上下文注入熔断。"""
+        session = await self.store.get_session(session_key)
+        if not session:
+            return
+        note = self._load_note(session)
+        if disabled:
+            note["context_inject_off"] = 1
+            note["context_inject_off_at"] = time.time()
+        else:
+            note.pop("context_inject_off", None)
+            note.pop("context_inject_off_at", None)
+        await self.store.update_session(
+            session_key, note=json.dumps(note, ensure_ascii=False)
+        )
+
+    @staticmethod
+    def _looks_like_llm_rejection(text: str) -> bool:
+        """判断一段回复是不是「LLM 输入被安全拦截」类的失败提示。"""
+        lowered = text.lower()
+        markers = (
+            "all chat models failed",
+            "input new_sensitive",
+            "sensitive",
+            "content_filter",
+            "content filter",
+            "input_filter",
+            "input filter",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _sanitize_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """对「要交给模型的消息」做裁剪与屏蔽词过滤。
+
+        为什么需要：插件会把群聊里的对话补进 LLM 请求，而 LLM 网关有输入安全
+        审核。一旦某条历史消息被判为敏感，之后**每一次**带上它的请求都会被拦，
+        表现为群里每次回复都报「All chat models failed」。这里做两道保险：
+
+        - 命中屏蔽词的消息整条丢弃（关键词由用户配置，默认空 = 不拦任何词）
+        - 单条超过长度上限的截断，避免长文把敏感段落带进去
+        """
+        keywords = [
+            str(item).strip().lower()
+            for item in self._cfg_list("context_blocked_keywords", [])
+            if str(item).strip()
+        ]
+        # 下限只保证不为空，允许用户把上限调到很小做更严格的裁剪
+        max_len = max(1, self._cfg_int("context_max_message_chars", 200))
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            content = str(msg.get("content") or "")
+            if keywords and any(key in content.lower() for key in keywords):
+                continue
+            if len(content) > max_len:
+                content = content[:max_len] + "…"
+            item = dict(msg)
+            item["content"] = content
+            result.append(item)
+        return result
+
     def _format_context_block(
         self,
         messages: list[dict[str, Any]],
@@ -473,6 +556,7 @@ class ProactiveCompanionPlugin(Star):
         改过昵称的用户会统一使用最新昵称，避免新旧两个名字混在一起。
         """
         # 统计「昵称 -> 用户 ID」的映射，判断哪些昵称存在重名
+        messages = self._sanitize_messages(messages)
         name_to_ids: dict[str, set[str]] = {}
         for msg in messages:
             name = str(msg.get("sender") or "").strip()
@@ -511,6 +595,10 @@ class ProactiveCompanionPlugin(Star):
         if not lines:
             return atmosphere_hint
         body = "\n".join(lines)
+        max_total = max(200, self._cfg_int("context_max_chars", 1200))
+        if len(body) > max_total:
+            # 保留最近的上下文（列表末尾才是最近的对话）
+            body = "…\n" + body[-max_total:]
         hint_block = f"{atmosphere_hint}\n" if atmosphere_hint else ""
         naming_rule = ""
         if peer_name:
@@ -888,6 +976,28 @@ class ProactiveCompanionPlugin(Star):
             return
 
         umo = event.unified_msg_origin
+
+        # LLM 网关把输入判为敏感时会整条失败（All chat models failed / sensitive）。
+        # 这种错误如果反复出现，说明注入的上下文里有内容被拦了——先熔断本会话的
+        # 上下文注入，让正常回复立刻恢复，再把原因记进事件日志。
+        if reply and self._looks_like_llm_rejection(reply):
+            await self.store.add_event(
+                "llm_input_rejected",
+                umo,
+                {"reply": reply[:200], "at": _now_str()},
+            )
+            try:
+                if not await self._context_inject_disabled(umo):
+                    await self._set_context_inject(umo, True)
+                    logger.warning(
+                        f"[主动陪伴] 会话 {umo} 的上下文注入已自动熔断"
+                        "（LLM 输入被安全拦截），可用 `/陪伴 上下文 恢复` 重新开启。"
+                    )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f"[主动陪伴] 熔断上下文注入失败: {exc}")
+            # 错误提示不是正常回复，不要写进聊天记录
+            reply = ""
+
         chat_type = self._chat_type(event)
         title = self._session_title(event)
         platform = event.get_platform_name() or ""
@@ -1334,6 +1444,8 @@ class ProactiveCompanionPlugin(Star):
         recent = await self.store.recent_messages(
             session_key, self._cfg_int("max_context_messages", 12) + 8
         )
+        # 同样做裁剪与屏蔽词过滤，避免历史消息把整次请求判成敏感
+        recent = self._sanitize_messages(recent)
         history = await self._astro_history(umo)
         names, _, peer_name = await self._nickname_context(session_key)
         context_block = generator.build_context_block(
@@ -1524,6 +1636,50 @@ class ProactiveCompanionPlugin(Star):
         yield event.plain_result(text)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @companion.command("上下文", alias={"context", "ctx"})
+    async def companion_context(self, event: AstrMessageEvent):
+        """查看 / 开关当前会话的上下文注入"""
+        umo = event.unified_msg_origin
+        tail = self._cmd_tail(event, "上下文", "context", "ctx").strip()
+        await self.store.ensure_session(
+            umo,
+            umo,
+            event.get_platform_name() or "",
+            self._chat_type(event),
+            self._session_title(event),
+        )
+        if tail in ("恢复", "开启", "on", "enable"):
+            await self._set_context_inject(umo, False)
+            await self.store.add_event("context_inject_resumed", umo)
+            yield event.plain_result(
+                "已恢复本会话的上下文注入。\n"
+                "如果还是报「All chat models failed」，可以在插件配置里"
+                "把「上下文屏蔽词」填上被拦的关键词，或把「启用上下文注入」关掉。"
+            )
+            return
+        if tail in ("暂停", "关闭", "off", "disable"):
+            await self._set_context_inject(umo, True)
+            await self.store.add_event("context_inject_paused", umo)
+            yield event.plain_result(
+                "已暂停本会话的上下文注入（Bot 主动接话时不再附带聊天记录）。"
+            )
+            return
+
+        disabled = await self._context_inject_disabled(umo)
+        global_on = self._cfg_bool("context_injection_enabled", True)
+        keywords = self._cfg_list("context_blocked_keywords", [])
+        lines = [
+            "【上下文注入状态】",
+            f"全局开关：{'开' if global_on else '关'}",
+            f"当前会话：{'已熔断（不注入）' if disabled else '正常注入'}",
+            f"单条上限：{self._cfg_int('context_max_message_chars', 200)} 字",
+            f"总长度上限：{self._cfg_int('context_max_chars', 1200)} 字",
+            f"屏蔽词：{'、'.join(str(k) for k in keywords) if keywords else '（未设置）'}",
+            "指令：`/陪伴 上下文 暂停` 暂停本会话注入，`/陪伴 上下文 恢复` 重新开启。",
+        ]
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("说说", alias={"talk", "speak"})
     async def companion_talk(self, event: AstrMessageEvent):
         """立刻触发一条主动消息"""
@@ -1575,6 +1731,11 @@ class ProactiveCompanionPlugin(Star):
             f"免打扰：{self._cfg_list('quiet_hours', []) or '（未设置）'}",
             f"上下文采集：{'开' if self._cfg_bool('capture_context_enabled', True) else '关'}"
             f"（已跟踪 {len(self._tracked_sessions)} 个会话）",
+            f"上下文注入：{'开' if self._cfg_bool('context_injection_enabled', True) else '关'}"
+            f"（单条 ≤{self._cfg_int('context_max_message_chars', 200)} 字，"
+            f"总长 ≤{self._cfg_int('context_max_chars', 1200)} 字，"
+            f"屏蔽词 {'、'.join(str(k) for k in self._cfg_list('context_blocked_keywords', [])) or '无'}）",
+            f"本会话注入：{'已熔断' if await self._context_inject_disabled(umo) else '正常'}",
             f"最近判定：{self._last_reply_decision}",
         ]
         if self._reply_skip_reasons:
