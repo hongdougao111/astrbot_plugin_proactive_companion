@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import logging
 import random
 import re
 import time
@@ -14,9 +13,13 @@ from typing import Any
 
 from .emotion import EmotionState, label_for, tone_hint
 
-# 用标准 logging，这样 core 模块不依赖 AstrBot 运行时也能独立导入与测试；
-# 在 AstrBot 里这些日志会照常出现在插件日志中。
-logger = logging.getLogger("astrbot.plugins.proactive_companion")
+try:
+    # 规范要求：运行路径必须使用 astrbot.api 提供的 logger。
+    from astrbot.api import logger
+except ImportError:  # pragma: no cover - 仅在没有 AstrBot 运行时的独立测试环境下回退
+    import logging
+
+    logger = logging.getLogger("astrbot.plugins.proactive_companion")
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是一个有性格的 AI 伙伴。你会主动给用户发消息，就像真人发微信一样自然。"

@@ -29,6 +29,12 @@ desc: |
   `/陪伴 改画像`、`/陪伴 重建画像`、`/陪伴 清除记忆`、`/陪伴 说说`、`/陪伴 诊断`、`/陪伴 清空`
   （指令仅限管理员使用，普通成员触发时会收到权限不足提示）
 
+  **v1.2.7 更新说明**
+
+  - **符合 AstrBot 上架规范**：`core/generator.py` 改为从 `astrbot.api` 导入 `logger`，
+    不再使用 Python 内置的 `logging` 模块记录运行日志（无 AstrBot 运行时的独立测试环境
+    会自动回退，功能不受影响）。
+
   **v1.2.6 更新说明**
 
   - **名单功能补全**：私聊与群聊现在都有**白名单 + 黑名单**，而且群聊主动搭话
@@ -233,7 +239,7 @@ desc: |
     **临时上下文**注入本次 LLM 请求（不写入会话历史）。
   - 白名单语义调整：留空 = 不限制；`proactive_reply_enabled` 默认开启，概率默认 0.2。
   - 新增 `/陪伴 诊断` 指令与面板「最近判定 / 跳过原因」，几秒内可定位为什么没触发。
-version: 1.2.6
+version: 1.2.7
 author: hongdougao111
 repo: https://github.com/hongdougao111/astrbot_plugin_proactive_companion
 social_link: https://github.com/hongdougao111

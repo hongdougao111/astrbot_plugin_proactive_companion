@@ -155,6 +155,12 @@ python tests/test_proactive_companion.py
 
 ## 📋 更新日志
 
+### v1.2.7
+
+- **符合 AstrBot 上架规范**：`core/generator.py` 改为从 `astrbot.api` 导入 `logger`，
+  不再使用 Python 内置的 `logging` 模块记录运行日志（无 AstrBot 运行时的独立测试环境
+  会自动回退，功能不受影响）。
+
 ### v1.2.6
 
 - **名单功能补全**：私聊与群聊现在都有**白名单 + 黑名单**，
