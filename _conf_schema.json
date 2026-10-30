@@ -108,6 +108,33 @@
     },
     "hint": "留空 = 不限制（任何人的私聊都可以被主动搭话）。填写用户 ID、昵称或会话 ID 后，只有命中的人才会在私聊里被主动搭话，其余人的私聊保持安静；群聊不受影响。昵称按最新昵称匹配，改了昵称也有效。"
   },
+  "private_proactive_blacklist": {
+    "description": "私聊主动搭话黑名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "命中的人私聊不会被主动搭话。黑名单优先于白名单；留空 = 不限制。可填用户 ID、昵称或会话 ID。"
+  },
+  "group_proactive_whitelist": {
+    "description": "群聊主动搭话白名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "留空 = 不限制（机器人可以在任何群里主动开口）。填写群号或群会话 ID 后，只有这些群才会被主动搭话；填 * 也是不限制。不影响主动回复。"
+  },
+  "group_proactive_blacklist": {
+    "description": "群聊主动搭话黑名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "命中的群不会被主动搭话。黑名单优先于白名单；留空 = 不限制。可填群号或群会话 ID。"
+  },
   "mention_only_in_group": {
     "description": "群聊中仅在被 @ 后才主动发言",
     "type": "bool",
@@ -205,7 +232,16 @@
     "items": {
       "type": "string"
     },
-    "hint": "留空 = 不限制（任何人都可能触发主动回复）。填写用户 ID、群号、会话 ID 或 unified_msg_origin 后，只有命中者才会触发；填 * 也是不限制。"
+    "hint": "留空 = 不限制（任何人都可能触发主动回复）。填写用户 ID、昵称、群号、会话 ID 或 unified_msg_origin 后，只有命中者才会触发；填 * 也是不限制。忽略大小写。"
+  },
+  "proactive_reply_blacklist": {
+    "description": "主动回复黑名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "命中的人的消息不会触发主动回复。黑名单优先于白名单；留空 = 不限制。可填用户 ID、昵称、群号或会话 ID。"
   },
   "proactive_reply_cooldown_minutes": {
     "description": "主动回复冷却（分钟）",

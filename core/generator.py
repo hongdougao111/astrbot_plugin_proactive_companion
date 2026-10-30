@@ -6,12 +6,17 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import re
 import time
 from typing import Any
 
 from .emotion import EmotionState, label_for, tone_hint
+
+# 用标准 logging，这样 core 模块不依赖 AstrBot 运行时也能独立导入与测试；
+# 在 AstrBot 里这些日志会照常出现在插件日志中。
+logger = logging.getLogger("astrbot.plugins.proactive_companion")
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是一个有性格的 AI 伙伴。你会主动给用户发消息，就像真人发微信一样自然。"
@@ -211,7 +216,9 @@ async def generate_text(
             text = sanitize(text)
             if text:
                 return text
-        except Exception:
-            # 记录异常但不打断主动消息流程
-            pass
+            logger.warning("[主动陪伴] 模型返回了空内容，改用模板文案")
+        except Exception as exc:
+            # 记录异常但不打断主动消息流程：调用失败不应该让功能直接不可用，
+            # 但必须留下痕迹，否则用户只会看到一句莫名其妙的模板文案。
+            logger.warning(f"[主动陪伴] 调用模型失败，改用模板文案: {exc}")
     return fallback_text(mood, is_group)

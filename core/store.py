@@ -839,13 +839,16 @@ class Store:
         """
 
         def _do(conn: sqlite3.Connection) -> int:
-            bot_counts = {
-                str(row["session_key"]): int(row["c"])
-                for row in conn.execute(
-                    "SELECT session_key, COUNT(*) AS c FROM messages"
-                    " WHERE role = 'bot' GROUP BY session_key"
-                ).fetchall()
-            }
+            # 每个会话里机器人发言的时间点（用于估算「这个用户发言后机器人回了几次」）
+            bot_times: dict[str, list[float]] = {}
+            for row in conn.execute(
+                "SELECT session_key, ts FROM messages WHERE role = 'bot'"
+            ).fetchall():
+                bot_times.setdefault(str(row["session_key"]), []).append(
+                    float(row["ts"] or 0.0)
+                )
+            for times in bot_times.values():
+                times.sort()
             rows = conn.execute(
                 "SELECT session_key, sender_id, sender, COUNT(*) AS c,"
                 " MIN(ts) AS first_ts, MAX(ts) AS last_ts FROM messages"
@@ -860,7 +863,11 @@ class Store:
                 first_ts = float(row["first_ts"] or 0.0)
                 last_ts = float(row["last_ts"] or 0.0)
                 sender = str(row["sender"] or "")
-                bot_count = bot_counts.get(session_key, 0)
+                # 只统计「这个人最后一次发言之后」的机器人回复。
+                # 直接用整个群的 bot 消息总数会让每个人的回应次数都一样，
+                # 算出来的回应率能到几百个百分点。
+                times = bot_times.get(session_key) or []
+                bot_count = sum(1 for ts in times if ts >= last_ts) if times else 0
                 existing = conn.execute(
                     "SELECT * FROM user_profiles WHERE session_key = ? AND user_id = ?",
                     (session_key, user_id),

@@ -79,9 +79,15 @@ SAFE_DEFAULTS: dict[str, Any] = {
     "private_skip_atmosphere": True,
     "private_priority": True,
     "private_proactive_whitelist": [],
+    # 名单类配置统一约定：黑名单优先于白名单；留空或填 `*` 表示不限制。
+    "private_proactive_blacklist": [],
+    "group_proactive_whitelist": [],
+    "group_proactive_blacklist": [],
+    "proactive_reply_blacklist": [],
     "mood_enabled": True,
     "mood_decay_per_hour": 0.15,
     "mood_affect_frequency": True,
+    "affection_enabled": True,
     "tts_enabled": False,
     "tts_provider_id": "",
     "tts_send_text": True,
@@ -124,6 +130,8 @@ _PLUGIN_REF: ProactiveCompanionPlugin | None = None
 _CAPTURED_FLAG = "_pac_message_captured"
 # 主动回复事件上的标记：本次 LLM 请求需要注入插件记录的上下文
 _PROACTIVE_SESSION_KEY = "_pac_proactive_session"
+# 标记：这条消息触发的是主动回复，好感度与回应次数已经计过
+_PROACTIVE_REPLY_FLAG = "_pac_proactive_reply"
 
 
 class ProactiveReplyFilter(CustomFilter):
@@ -210,8 +218,11 @@ class ProactiveCompanionPlugin(Star):
         self._last_tick_error: str = ""
         # 主动回复：记录每个会话上次触发的时间，用于冷却
         self._proactive_reply_times: dict[str, float] = {}
-        # 已经触发过主动回复的消息 ID：防止同一条消息被重复投递时连发多条
-        self._reply_triggered_message_ids: set[str] = set()
+        # 已经触发过主动回复的消息 ID -> 时间戳：防止同一条消息被重复投递时连发多条
+        self._reply_triggered_message_ids: dict[str, float] = {}
+        # 每个会话里「用户 ID -> 最新昵称」的同步缓存，供过滤器里做白名单匹配
+        # （过滤器是同步的，不能 await 数据库）
+        self._latest_names: dict[str, dict[str, str]] = {}
         # 被动采集：已经被记录过对话的会话
         self._tracked_sessions: set[str] = set()
         # 最近一次主动回复判定结果，便于在面板上排查为什么没触发
@@ -684,6 +695,10 @@ class ProactiveCompanionPlugin(Star):
         sender_id: str = "",
     ) -> bool:
         """写入一条用户消息，短时间内重复的同一条内容会被忽略。"""
+        # 顺手更新昵称缓存：白名单要能按昵称匹配，而过滤器是同步的
+        if sender_id and sender:
+            names = self._latest_names.setdefault(session_key, {})
+            names[str(sender_id)] = str(sender)
         try:
             return bool(
                 await self.store.add_message(
@@ -802,27 +817,32 @@ class ProactiveCompanionPlugin(Star):
             umo = event.unified_msg_origin
         except Exception:
             return False
-        if umo in self._tracked_sessions:
-            return True
-        whitelist = [
-            str(item).strip()
-            for item in self._cfg_list("proactive_reply_whitelist", [])
-            if str(item).strip()
-        ]
-        if not whitelist or "*" in whitelist:
-            # 允许所有人主动回复 → 记录所有会话的上下文
-            return self._can_track_more()
-        candidates: set[str] = set()
+        # 命中黑名单的会话一律不记录：既然不想被主动搭话，
+        # 也不希望聊天内容被存下来。
+        candidates: set[str] = {str(umo)}
         for getter in ("get_sender_id", "get_group_id", "get_session_id"):
             try:
                 candidates.add(str(getattr(event, getter)() or ""))
             except Exception:
                 pass
-        try:
-            candidates.add(str(event.unified_msg_origin or ""))
-        except Exception:
-            pass
-        if any(item in candidates for item in whitelist):
+        if ":" in str(umo):
+            candidates.add(str(umo).rsplit(":", 1)[-1])
+        private_blacklist = self._cfg_list_names("private_proactive_blacklist")
+        group_blacklist = self._cfg_list_names("group_proactive_blacklist")
+        reply_blacklist = self._cfg_list_names("proactive_reply_blacklist")
+        if self._hit_any(private_blacklist, candidates) or self._hit_any(
+            group_blacklist, candidates
+        ):
+            return False
+        if self._hit_any(reply_blacklist, candidates):
+            return False
+        if umo in self._tracked_sessions:
+            return True
+        whitelist = self._cfg_list_names("proactive_reply_whitelist")
+        if not whitelist or "*" in whitelist:
+            # 允许所有人主动回复 → 记录所有会话的上下文
+            return self._can_track_more()
+        if self._hit_any(whitelist, candidates):
             return self._can_track_more()
         return False
 
@@ -862,6 +882,12 @@ class ProactiveCompanionPlugin(Star):
                 (event.message_str or "").strip(),
                 event="proactive_reply",
             )
+        # 标记一下：这次回复已经计过好感度与「机器人回应」，
+        # 事件收尾时（_record_turn）不要再重复计一次。
+        try:
+            event.set_extra(_PROACTIVE_REPLY_FLAG, True)
+        except Exception:  # pragma: no cover
+            pass
         session = await self.store.get_session(umo)
         count = int((session or {}).get("proactive_replies") or 0) + 1
         await self.store.update_session(umo, proactive_replies=count)
@@ -913,10 +939,24 @@ class ProactiveCompanionPlugin(Star):
             return False, "消息在 @ 其他人"
         if self._looks_like_command(content, cfg):
             return False, "指令消息"
-        if dnd.in_quiet_hours(_dt.datetime.now(), self._cfg_list("quiet_hours", [])):
+        # 免打扰与「允许主动发言」开关要和定时主动消息保持一致，
+        # 否则关掉了私聊免打扰，私聊里对方一说话插件还是会主动接话。
+        chat_type = self._chat_type(event)
+        if chat_type == "group" and not self._cfg_bool("group_enabled", True):
+            return False, "群聊主动发言已关闭"
+        if chat_type == "private" and not self._cfg_bool("private_enabled", True):
+            return False, "私聊主动发言已关闭"
+        quiet = self._cfg_list("quiet_hours", [])
+        if chat_type == "private":
+            private_quiet = self._cfg_list("private_quiet_hours", [])
+            if private_quiet:
+                quiet = private_quiet
+        if dnd.in_quiet_hours(_dt.datetime.now(), quiet):
             return False, "处于免打扰时段"
         if not self._in_reply_whitelist(event):
             return False, "不在主动回复白名单内"
+        if self._in_reply_blacklist(event):
+            return False, "在主动回复黑名单内"
         umo = event.unified_msg_origin
         cooldown = max(0, self._cfg_int("proactive_reply_cooldown_minutes", 10))
         last = self._proactive_reply_times.get(umo, 0.0)
@@ -954,7 +994,7 @@ class ProactiveCompanionPlugin(Star):
         if mid:
             if mid in self._reply_triggered_message_ids:
                 return False, "这条消息已经触发过主动回复"
-            self._reply_triggered_message_ids.add(mid)
+            self._reply_triggered_message_ids[mid] = time.time()
             self._prune_reply_triggered_ids()
         # 判定通过时就立刻占用冷却时间戳：handler 是异步执行的，
         # 如果等到 handler 里才记，同一条消息被重复投递时会连续判定通过。
@@ -1008,7 +1048,10 @@ class ProactiveCompanionPlugin(Star):
             if prompt_text and key[0] == "user" and key[1] == prompt_text:
                 removed += 1
                 continue
-            if key in seen:
+            # 只删**相邻**的重复项：平台重复投递时同一条消息会连着出现好几次。
+            # 不做全局去重，否则用户隔几轮又说了一遍同样的话也会被删掉，
+            # 对话历史就被篡改了。
+            if key in seen and kept and _key(kept[-1]) == key:
                 removed += 1
                 continue
             seen.add(key)
@@ -1035,7 +1078,17 @@ class ProactiveCompanionPlugin(Star):
         """清理过期的「已触发主动回复的消息 ID」，避免集合无限增长。"""
         if len(self._reply_triggered_message_ids) < 500:
             return
-        self._reply_triggered_message_ids.clear()
+        # 按时间淘汰最早的，而不是整表清空——整表清空会让旧的消息 ID
+        # 重新变得「没触发过」，老问题就复发 了。
+        cutoff = time.time() - 3600.0
+        stale = [
+            mid for mid, ts in self._reply_triggered_message_ids.items() if ts < cutoff
+        ]
+        for mid in stale:
+            self._reply_triggered_message_ids.pop(mid, None)
+        # 还是太多（短时间内触发了很多次）就整表清空
+        if len(self._reply_triggered_message_ids) >= 500:
+            self._reply_triggered_message_ids.clear()
 
     def _looks_like_command(self, content: str, cfg: Any) -> bool:
         """判断消息是否是指令（指令消息不参与主动回复）。"""
@@ -1052,19 +1105,8 @@ class ProactiveCompanionPlugin(Star):
             prefixes = []
         return any(prefix and content.startswith(prefix) for prefix in prefixes)
 
-    def _in_reply_whitelist(self, event: AstrMessageEvent) -> bool:
-        """白名单判定：命中发送者 ID / 会话 ID / 群号 / umo 之一即可。
-
-        白名单为空表示不做额外限制（谁都可以触发主动回复）；
-        填 `*` 语义相同。填写具体值后，只有命中者才会触发。
-        """
-        whitelist = [
-            str(item).strip()
-            for item in self._cfg_list("proactive_reply_whitelist", [])
-            if str(item).strip()
-        ]
-        if not whitelist or "*" in whitelist:
-            return True
+    def _reply_name_candidates(self, event: AstrMessageEvent) -> set[str]:
+        """收集主动回复名单判定时可用的标识：发送者 ID / 昵称 / 会话 ID / 群号 / umo。"""
         candidates: set[str] = set()
         try:
             candidates.add(str(event.get_sender_id() or ""))
@@ -1082,7 +1124,38 @@ class ProactiveCompanionPlugin(Star):
             candidates.add(str(event.unified_msg_origin or ""))
         except Exception:
             pass
-        return any(item in candidates for item in whitelist)
+        # 昵称：只匹配**当前发送者**的最新昵称。
+        # （不能把会话里所有人的昵称都算进来，否则填了 A 的昵称会让 B 也能触发。）
+        try:
+            session_key = str(event.unified_msg_origin or "")
+            names = self._latest_names.get(session_key) or {}
+            sender_id = str(event.get_sender_id() or "")
+            if sender_id and names.get(sender_id):
+                candidates.add(str(names[sender_id]))
+        except Exception:  # pragma: no cover
+            pass
+        return {item for item in candidates if item}
+
+    def _in_reply_whitelist(self, event: AstrMessageEvent) -> bool:
+        """主动回复白名单判定：命中发送者 ID / 昵称 / 会话 ID / 群号 / umo 之一即可。
+
+        白名单为空表示不做额外限制（谁都可以触发主动回复）；
+        填 `*` 语义相同。填写具体值后，只有命中者才会触发。
+
+        与私聊白名单保持一致：**忽略大小写**，并且支持用昵称匹配
+        （昵称取该会话里最新出现过的那个，改了昵称也不会失效）。
+        """
+        whitelist = self._cfg_list_names("proactive_reply_whitelist")
+        if not whitelist or "*" in whitelist:
+            return True
+        return self._hit_any(whitelist, self._reply_name_candidates(event))
+
+    def _in_reply_blacklist(self, event: AstrMessageEvent) -> bool:
+        """主动回复黑名单判定：命中就不主动回复（优先于白名单）。"""
+        blacklist = self._cfg_list_names("proactive_reply_blacklist")
+        if not blacklist:
+            return False
+        return self._hit_any(blacklist, self._reply_name_candidates(event))
 
     @filter.on_decorating_result()
     async def capture_turn(self, event: AstrMessageEvent) -> None:
@@ -1162,7 +1235,10 @@ class ProactiveCompanionPlugin(Star):
             await self.store.add_message(
                 umo, "bot", reply, "bot", "", dedupe_window=10.0
             )
-            if sender_id:
+            # 主动回复已经在 _on_proactive_reply 里计过好感度与回应次数，
+            # 这里再计一次会让「机器人回应 N 次」与好感度都翻倍。
+            already_counted = bool(event.get_extra(_PROACTIVE_REPLY_FLAG, False))
+            if sender_id and not already_counted:
                 await self._update_affection(
                     umo, sender_id, sender_name, event="bot_reply"
                 )
@@ -1379,6 +1455,8 @@ class ProactiveCompanionPlugin(Star):
             return False
         if is_private and not await self._private_whitelisted(session):
             return False
+        if chat_type == "group" and not await self._group_whitelisted(session):
+            return False
 
         limits = self._effective_limits(chat_type)
         quiet = limits["quiet_hours"]
@@ -1403,7 +1481,13 @@ class ProactiveCompanionPlugin(Star):
 
         base_idle = float(limits["min_idle"])
         min_idle = self._idle_threshold_minutes(base_idle)
-        idle_minutes = (now - anchor) / 60.0 if anchor else 0.0
+        if anchor:
+            idle_minutes = (now - anchor) / 60.0
+        else:
+            # 从没记录到过任何消息（新建的会话，或刚被清空过记忆）：
+            # 按「已经沉默了很久」处理，否则这些会话永远等不到主动搭话。
+            created_at = float(session.get("created_at") or 0.0)
+            idle_minutes = (now - created_at) / 60.0 if created_at else 1e6
         # 读空气：群正热闹或气氛紧张时不要硬插话。
         # 私聊是两个人的对话，气氛判定本来就没意义（还可能因为一句气话被判成「紧张」，
         # 结果私聊里彻底闭嘴），所以默认不套用群气氛规则。
@@ -1418,6 +1502,19 @@ class ProactiveCompanionPlugin(Star):
                 min_idle = min_idle * 0.5
         if idle_minutes < min_idle:
             return False
+
+        # 情绪影响发言频率：心情低落时收敛一些，心情好时更积极。
+        # （此前这个配置项没有任何实现，属于「面板能改但没效果」的死配置。）
+        if self._cfg_bool("mood_affect_frequency", True):
+            mood_now = self._session_mood(session)
+            if mood_now.valence < -0.2:
+                # 低落：要求再多沉默一会儿才开口
+                min_idle *= 1.5
+                if idle_minutes < min_idle:
+                    return False
+            elif mood_now.valence > 0.3:
+                # 心情好：允许稍微早一点
+                min_idle *= 0.8
 
         cooldown = int(limits["cooldown"])
 
@@ -1482,28 +1579,44 @@ class ProactiveCompanionPlugin(Star):
         random.shuffle(others)
         return private + others
 
-    async def _private_whitelisted(self, session: dict[str, Any]) -> bool:
-        """私聊主动搭话白名单。
+    def _cfg_list_names(self, key: str) -> list[str]:
+        """读取一个名单类配置（去掉空项）。"""
+        return [
+            str(item).strip() for item in self._cfg_list(key, []) if str(item).strip()
+        ]
 
+    @staticmethod
+    def _hit_any(items: list[str], candidates: set[str]) -> bool:
+        """名单是否命中候选集合（忽略大小写）。"""
+        if not items:
+            return False
+        lowered = {item.lower() for item in candidates if item}
+        return any(item in candidates or item.lower() in lowered for item in items)
+
+    async def _private_whitelisted(self, session: dict[str, Any]) -> bool:
+        """私聊主动搭话名单判定。
+
+        - **黑名单优先**：命中黑名单的人，私聊不会被主动搭话；
         - 留空（或填 `*`）= 不限制，任何人的私聊都可以被主动搭话；
-        - 填了具体值之后，**只有命中的人**的私聊才会被主动搭话，其余人的私聊
+        - 填了白名单之后，**只有命中的人**的私聊才会被主动搭话，其余人的私聊
           保持安静（群聊完全不受影响）。
 
         可填：对方用户 ID、昵称、会话 ID（umo）。昵称按「手动昵称 > 平台昵称」
         取最新那个，所以改了昵称也不会失效。
         """
-        whitelist = [
-            str(item).strip()
-            for item in self._cfg_list("private_proactive_whitelist", [])
-            if str(item).strip()
-        ]
-        if not whitelist or "*" in whitelist:
+        blacklist = self._cfg_list_names("private_proactive_blacklist")
+        whitelist = self._cfg_list_names("private_proactive_whitelist")
+        if not blacklist and (not whitelist or "*" in whitelist):
             return True
         session_key = str(session.get("session_key") or "")
         candidates: set[str] = {
             session_key,
             str(session.get("umo") or ""),
         }
+        # 会话键形如「平台:类型:ID」，末段就是群号 / 用户 ID，
+        # 这样直接填「12345」也能命中，不用先知道完整的会话键。
+        if ":" in session_key:
+            candidates.add(session_key.rsplit(":", 1)[-1])
         try:
             names, peer_id, peer_name = await self._nickname_context(session_key)
         except Exception:  # pragma: no cover
@@ -1513,8 +1626,36 @@ class ProactiveCompanionPlugin(Star):
         if peer_name:
             candidates.add(peer_name)
         candidates.update(str(uid) for uid in names)
-        lowered = {item.lower() for item in candidates if item}
-        return any(item in candidates or item.lower() in lowered for item in whitelist)
+        # 黑名单优先
+        if self._hit_any(blacklist, candidates):
+            return False
+        if not whitelist or "*" in whitelist:
+            return True
+        return self._hit_any(whitelist, candidates)
+
+    async def _group_whitelisted(self, session: dict[str, Any]) -> bool:
+        """群聊主动搭话名单判定（与私聊同样的黑名单优先规则）。
+
+        可填：群号、群会话 ID（umo）。留空或填 `*` = 不限制。
+        """
+        blacklist = self._cfg_list_names("group_proactive_blacklist")
+        whitelist = self._cfg_list_names("group_proactive_whitelist")
+        if not blacklist and (not whitelist or "*" in whitelist):
+            return True
+        candidates: set[str] = {
+            str(session.get("session_key") or ""),
+            str(session.get("umo") or ""),
+            str(session.get("title") or ""),
+        }
+        # 会话键末段就是群号，方便直接填「12345」
+        session_key = str(session.get("session_key") or "")
+        if ":" in session_key:
+            candidates.add(session_key.rsplit(":", 1)[-1])
+        if self._hit_any(blacklist, candidates):
+            return False
+        if not whitelist or "*" in whitelist:
+            return True
+        return self._hit_any(whitelist, candidates)
 
     def _effective_limits(self, chat_type: str) -> dict[str, Any]:
         """按会话类型算出**实际生效**的阈值。
@@ -1865,10 +2006,19 @@ class ProactiveCompanionPlugin(Star):
             await self.store.add_message(
                 umo, "proactive", text, "bot", "", dedupe_window=10.0
             )
+            # 手动发送也要计入每日额度，否则反复点「说说」可以绕过上限
+            today = _dt.date.today().isoformat()
+            daily_count = (
+                int(session.get("daily_count") or 0)
+                if str(session.get("daily_date") or "") == today
+                else 0
+            )
             await self.store.update_session(
                 umo,
                 last_proactive_at=time.time(),
                 messages_sent=int(session.get("messages_sent") or 0) + 1,
+                daily_count=daily_count + 1,
+                daily_date=today,
             )
             await self.store.add_event("manual_proactive", umo, {"text": text})
             yield event.plain_result("（已发送）")
@@ -2568,8 +2718,9 @@ class ProactiveCompanionPlugin(Star):
         keep_messages = bool(payload.get("keep_messages"))
         if scope == "session" and not session_key:
             return error_response("缺少 session_key")
-        if scope in ("user", "profiles") and not user_id:
+        if scope == "user" and not user_id:
             return error_response("缺少 user_id")
+        # scope="profiles" 表示清空**所有**画像，本来就不需要 user_id
         if scope not in ("session", "user", "profiles", "all"):
             return error_response("scope 只能是 session / user / profiles / all")
         try:
@@ -2911,6 +3062,14 @@ class ProactiveCompanionPlugin(Star):
         if not key:
             return error_response("缺少 session_key")
         ok = await self.store.delete_session(key)
+        # 内存里的缓存也要一起清掉，否则：
+        # - 采集名额被永久占用，新会话再也采集不到上下文；
+        # - 面板仍显示已删除会话的气氛，成了幽灵会话。
+        self._tracked_sessions.discard(key)
+        self._atmosphere_cache.pop(key, None)
+        self._atmosphere_refreshed_at.pop(key, None)
+        self._latest_names.pop(key, None)
+        self._proactive_reply_times.pop(key, None)
         await self.store.add_event("session_deleted", key)
         return json_response({"deleted": ok})
 
@@ -2952,10 +3111,19 @@ class ProactiveCompanionPlugin(Star):
             await self.store.add_message(
                 key, "proactive", text, "bot", "", dedupe_window=10.0
             )
+            # 面板「立即发送」同样计入每日额度
+            today = _dt.date.today().isoformat()
+            daily_count = (
+                int(session.get("daily_count") or 0)
+                if str(session.get("daily_date") or "") == today
+                else 0
+            )
             await self.store.update_session(
                 key,
                 last_proactive_at=time.time(),
                 messages_sent=int(session.get("messages_sent") or 0) + 1,
+                daily_count=daily_count + 1,
+                daily_date=today,
             )
             await self.store.add_event("web_proactive", key, {"text": text})
         return json_response({"sent": sent, "text": text})

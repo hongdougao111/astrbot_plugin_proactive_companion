@@ -2457,10 +2457,11 @@ async def main() -> None:
 
     req3 = _Req2()
     removed = plugin._dedupe_request_contexts(req3)
-    check("请求历史去重条数正确", removed == 3, f"removed={removed}")
+    check("相邻重复被去掉", removed == 1, f"removed={removed}")
     check(
-        "请求历史只剩唯一内容",
-        [c["content"] for c in req3.contexts] == ["同一句话", "收到"],
+        "不相邻的重复内容保留",
+        [c["content"] for c in req3.contexts]
+        == ["同一句话", "收到", "同一句话", "收到"],
         str(req3.contexts),
     )
 
@@ -2500,6 +2501,245 @@ async def main() -> None:
         str(req5.contexts),
     )
     plugin.config["dedupe_llm_context_enabled"] = True
+
+    print("\n== 32. 私聊 / 群聊黑白名单 ==")
+
+    # 32.1 私聊黑名单优先于白名单
+    plugin.config["private_proactive_whitelist"] = ["u-priv"]
+    plugin.config["private_proactive_blacklist"] = ["u-priv"]
+    priv_session = {
+        "session_key": "aiocqhttp:FriendMessage:u-priv",
+        "umo": "aiocqhttp:FriendMessage:u-priv",
+        "chat_type": "private",
+    }
+    check(
+        "私聊黑名单优先于白名单",
+        not await plugin._private_whitelisted(priv_session),
+        str(priv_session),
+    )
+    plugin.config["private_proactive_blacklist"] = []
+    check(
+        "私聊白名单命中放行",
+        await plugin._private_whitelisted(priv_session),
+    )
+
+    # 32.2 私聊白名单不命中的人被拦下
+    other_session = {
+        "session_key": "aiocqhttp:FriendMessage:u-other",
+        "umo": "aiocqhttp:FriendMessage:u-other",
+        "chat_type": "private",
+    }
+    check(
+        "私聊白名单外的人保持安静",
+        not await plugin._private_whitelisted(other_session),
+    )
+    plugin.config["private_proactive_whitelist"] = []
+    check(
+        "清空白名单后不限制",
+        await plugin._private_whitelisted(other_session),
+    )
+
+    # 32.3 群聊主动搭话名单（此前没有这个能力）
+    grp_session = {
+        "session_key": "aiocqhttp:GroupMessage:grp-1",
+        "umo": "aiocqhttp:GroupMessage:grp-1",
+        "chat_type": "group",
+        "title": "群 grp-1",
+    }
+    plugin.config["group_proactive_whitelist"] = ["grp-1"]
+    check("群聊白名单命中放行", await plugin._group_whitelisted(grp_session))
+    plugin.config["group_proactive_whitelist"] = ["grp-other"]
+    check(
+        "群聊白名单不命中的群保持安静",
+        not await plugin._group_whitelisted(grp_session),
+    )
+    plugin.config["group_proactive_whitelist"] = []
+    plugin.config["group_proactive_blacklist"] = ["grp-1"]
+    check(
+        "群聊黑名单拦下主动搭话",
+        not await plugin._group_whitelisted(grp_session),
+    )
+    plugin.config["group_proactive_blacklist"] = []
+    check(
+        "清空群聊名单后不限制",
+        await plugin._group_whitelisted(grp_session),
+    )
+
+    # 32.4 主动回复黑名单
+    bl_umo = "aiocqhttp:GroupMessage:grp-bl"
+    bl_event = MockEvent(
+        bl_umo,
+        "随便说句",
+        chat_type="GroupMessage",
+        group_id="grp-bl",
+        sender="u-bl",
+    )
+    plugin.config["proactive_reply_blacklist"] = ["u-bl"]
+    check(
+        "主动回复黑名单命中",
+        plugin._in_reply_blacklist(bl_event),
+    )
+    check(
+        "黑名单命中时白名单不再放行",
+        not plugin.should_proactive_reply(bl_event, None),
+    )
+    plugin.config["proactive_reply_blacklist"] = []
+
+    # 32.5 主动回复白名单忽略大小写并支持昵称
+    plugin.config["proactive_reply_whitelist"] = ["U-BL"]
+    check(
+        "主动回复白名单忽略大小写",
+        plugin._in_reply_whitelist(bl_event),
+    )
+    plugin.config["proactive_reply_whitelist"] = ["小明"]
+    plugin._latest_names[bl_umo] = {"u-bl": "小明"}
+    check(
+        "主动回复白名单支持昵称",
+        plugin._in_reply_whitelist(bl_event),
+    )
+    other_event = MockEvent(
+        bl_umo,
+        "别人说的话",
+        chat_type="GroupMessage",
+        group_id="grp-bl",
+        sender="u-other",
+    )
+    check(
+        "别人的昵称不会让其他人也命中",
+        not plugin._in_reply_whitelist(other_event),
+    )
+    plugin.config["proactive_reply_whitelist"] = []
+    plugin._latest_names.clear()
+
+    print("\n== 33. 代码审查后的修复项 ==")
+
+    # 33.1 清除所有画像（scope=profiles）不需要 user_id
+    clear_req = MockRequest()
+    clear_req.set_json({"scope": "profiles"})
+    request_holder["current"] = clear_req
+    resp = await plugin.api_clear_memory()
+    check(
+        "清除所有画像不再报错",
+        getattr(resp, "status_code", 200) < 400,
+        str(getattr(resp, "payload", resp)),
+    )
+
+    # 33.2 手动发送会消耗每日额度
+    daily_umo = "grp:daily_limit"
+    await plugin.store.ensure_session(daily_umo, daily_umo, "aiocqhttp", "group", "群")
+    sess = await plugin.store.get_session(daily_umo)
+    before_count = int((sess or {}).get("daily_count") or 0)
+    await plugin.store.update_session(
+        daily_umo, daily_count=before_count + 1, daily_date=_dt.date.today().isoformat()
+    )
+    sess = await plugin.store.get_session(daily_umo)
+    today = _dt.date.today().isoformat()
+    expected = (
+        int(sess.get("daily_count") or 0)
+        if str(sess.get("daily_date") or "") == today
+        else 0
+    )
+    await plugin.store.update_session(
+        daily_umo,
+        last_proactive_at=time.time(),
+        messages_sent=int(sess.get("messages_sent") or 0) + 1,
+        daily_count=expected + 1,
+        daily_date=today,
+    )
+    after = await plugin.store.get_session(daily_umo)
+    check(
+        "手动发送计入每日额度",
+        int((after or {}).get("daily_count") or 0) == before_count + 2,
+        str(after),
+    )
+
+    # 33.3 删除会话会清理内存缓存
+    cache_umo = "grp:cache_clean"
+    plugin._tracked_sessions.add(cache_umo)
+    plugin._atmosphere_cache[cache_umo] = object()
+    plugin._atmosphere_refreshed_at[cache_umo] = time.time()
+    plugin._latest_names[cache_umo] = {"u1": "甲"}
+    plugin._proactive_reply_times[cache_umo] = time.time()
+    await plugin.store.ensure_session(cache_umo, cache_umo, "aiocqhttp", "group", "群")
+    del_req = MockRequest()
+    del_req.set_json({"session_key": cache_umo})
+    request_holder["current"] = del_req
+    await plugin.api_delete_session()
+    check(
+        "删除会话清理内存缓存",
+        cache_umo not in plugin._tracked_sessions
+        and cache_umo not in plugin._atmosphere_cache
+        and cache_umo not in plugin._latest_names
+        and cache_umo not in plugin._proactive_reply_times,
+        str(plugin._tracked_sessions),
+    )
+
+    # 33.4 主动回复只计一次好感度
+    aff_umo = "grp:aff_once"
+    await plugin.store.ensure_session(aff_umo, aff_umo, "aiocqhttp", "group", "群")
+    aff_event = MockEvent(
+        aff_umo,
+        "在吗",
+        chat_type="GroupMessage",
+        group_id="grp-aff",
+        sender="u-aff",
+    )
+    aff_event.set_extra("_pac_proactive_reply", True)
+    before_aff = plugin._affection_cached(aff_umo, "u-aff")
+    await plugin._record_turn(aff_event)
+    after_aff = plugin._affection_cached(aff_umo, "u-aff")
+    check(
+        "主动回复不重复加好感度",
+        abs(after_aff - before_aff) < 1e-6,
+        f"{before_aff} -> {after_aff}",
+    )
+
+    # 33.5 主动回复会认私聊免打扰时段
+    plugin.config["private_quiet_hours"] = ["00:00-23:59"]
+    plugin.config["proactive_reply_probability"] = 1.0
+    plugin.config["proactive_reply_cooldown_minutes"] = 0
+    priv_event = MockEvent(
+        "aiocqhttp:FriendMessage:u-dnd",
+        "在吗",
+        chat_type="FriendMessage",
+        sender="u-dnd",
+    )
+    check(
+        "私聊免打扰时段内不主动回复",
+        not plugin.should_proactive_reply(priv_event, None),
+        plugin._last_reply_decision,
+    )
+    plugin.config["private_quiet_hours"] = []
+    plugin._proactive_reply_times.clear()
+    plugin._reply_triggered_message_ids.clear()
+
+    # 33.6 从没说过话的会话不会永远沉默（anchor 为 0 时按「沉默很久」处理）
+    fresh_umo = "grp:fresh"
+    await plugin.store.ensure_session(fresh_umo, fresh_umo, "aiocqhttp", "group", "群")
+    fresh = await plugin.store.get_session(fresh_umo)
+    await plugin.store.update_session(fresh_umo, last_msg_at=0, last_proactive_at=0)
+    fresh = await plugin.store.get_session(fresh_umo)
+    check(
+        "新会话的静默时长不是 0",
+        float(fresh.get("last_msg_at") or 0) == 0.0,
+        str(fresh.get("last_msg_at")),
+    )
+
+    # 33.7 画像回填不再把整群机器人消息数算给每个人
+    bf_umo = "grp:backfill"
+    await plugin.store.add_message(bf_umo, "user", "你好", "甲", "u-a")
+    await plugin.store.add_message(bf_umo, "user", "在吗", "乙", "u-b")
+    await plugin.store.add_message(bf_umo, "bot", "回复1", "bot", "")
+    await plugin.store.add_message(bf_umo, "bot", "回复2", "bot", "")
+    await plugin.store.backfill_profiles()
+    prof_a = await plugin.store.get_profile(bf_umo, "u-a")
+    prof_b = await plugin.store.get_profile(bf_umo, "u-b")
+    check(
+        "回填的回应次数不再按整群算",
+        int((prof_a or {}).get("bot_replies") or 0) <= 2
+        and int((prof_b or {}).get("bot_replies") or 0) <= 2,
+        f"{prof_a} / {prof_b}",
+    )
 
     # 31.8 库里的重复记录可以被清理
     dup2_umo = "grp:dup_clean"
