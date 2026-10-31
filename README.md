@@ -155,6 +155,12 @@ python tests/test_proactive_companion.py
 
 ## 📋 更新日志
 
+### v1.2.9
+
+- **完全符合 AstrBot 上架规范**：`core/generator.py` 不再回退到 Python 内置的
+  `logging` 模块——日志记录器**只**来自 `astrbot.api`；在没有 AstrBot 运行时的
+  独立测试环境下，日志记录器置空并跳过输出，功能不受影响。
+
 ### v1.2.8
 
 - **修复：私聊白名单不生效**。此前名单匹配只能靠「会话 ID」推断对方身份，

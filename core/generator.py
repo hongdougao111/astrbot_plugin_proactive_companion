@@ -14,12 +14,19 @@ from typing import Any
 from .emotion import EmotionState, label_for, tone_hint
 
 try:
-    # 规范要求：运行路径必须使用 astrbot.api 提供的 logger。
+    # 规范要求：日志记录器必须且只能来自 astrbot.api，
+    # 不允许使用 Python 内置 logging 或第三方日志库。
     from astrbot.api import logger
-except ImportError:  # pragma: no cover - 仅在没有 AstrBot 运行时的独立测试环境下回退
-    import logging
+except ImportError:  # pragma: no cover - 仅在没有 AstrBot 运行时的独立测试环境下
+    # 此时没有可用的日志记录器，按规范置空，由调用处判空跳过日志输出。
+    logger = None
 
-    logger = logging.getLogger("astrbot.plugins.proactive_companion")
+
+def _log_warning(message: str) -> None:
+    """写一条警告日志；没有 AstrBot 运行时（logger 为 None）时静默跳过。"""
+    if logger is not None:
+        logger.warning(message)
+
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是一个有性格的 AI 伙伴。你会主动给用户发消息，就像真人发微信一样自然。"
@@ -219,9 +226,9 @@ async def generate_text(
             text = sanitize(text)
             if text:
                 return text
-            logger.warning("[主动陪伴] 模型返回了空内容，改用模板文案")
+            _log_warning("[主动陪伴] 模型返回了空内容，改用模板文案")
         except Exception as exc:
             # 记录异常但不打断主动消息流程：调用失败不应该让功能直接不可用，
             # 但必须留下痕迹，否则用户只会看到一句莫名其妙的模板文案。
-            logger.warning(f"[主动陪伴] 调用模型失败，改用模板文案: {exc}")
+            _log_warning(f"[主动陪伴] 调用模型失败，改用模板文案: {exc}")
     return fallback_text(mood, is_group)
