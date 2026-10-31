@@ -51,7 +51,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     atmosphere_updated_at REAL NOT NULL DEFAULT 0,
     mood_updated_at REAL NOT NULL DEFAULT 0,
     created_at      REAL NOT NULL DEFAULT 0,
-    note            TEXT DEFAULT ''
+    note            TEXT DEFAULT '',
+    peer_id         TEXT DEFAULT '',
+    peer_name       TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -145,6 +147,11 @@ class Store:
                 "atmosphere_level": "TEXT DEFAULT ''",
                 "atmosphere_data": "TEXT DEFAULT ''",
                 "atmosphere_updated_at": "REAL NOT NULL DEFAULT 0",
+                # 会话对方（私聊里的那个人 / 群里的发言人）单独记一份：
+                # 名单功能要靠它匹配，而且不能依赖「消息有没有被采集」——
+                # 没被采集的会话同样要能按对方身份命中名单。
+                "peer_id": "TEXT DEFAULT ''",
+                "peer_name": "TEXT DEFAULT ''",
             },
             "messages": {
                 "sender_id": "TEXT DEFAULT ''",
@@ -184,8 +191,15 @@ class Store:
         platform: str = "",
         chat_type: str = "",
         title: str = "",
+        peer_id: str = "",
+        peer_name: str = "",
     ) -> dict[str, Any]:
-        """确保会话存在并返回会话记录。"""
+        """确保会话存在并返回会话记录。
+
+        `peer_id` / `peer_name` 记录这个会话的对方身份（私聊里的那个人）。
+        名单匹配会用到它，而且**不能依赖消息是否被采集**——
+        没被采集的会话同样要能按对方身份命中白名单。
+        """
 
         def _do(conn: sqlite3.Connection) -> dict[str, Any] | None:
             row = conn.execute(
@@ -194,13 +208,16 @@ class Store:
             if row is None:
                 conn.execute(
                     "INSERT INTO sessions (session_key, umo, platform, chat_type, title,"
-                    " created_at, mood_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    " peer_id, peer_name, created_at, mood_updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         session_key,
                         umo,
                         platform,
                         chat_type,
                         title,
+                        peer_id,
+                        peer_name,
                         time.time(),
                         time.time(),
                     ),
@@ -215,6 +232,20 @@ class Store:
                         "UPDATE sessions SET umo = ?, platform = ?, chat_type = ?,"
                         " title = ? WHERE session_key = ?",
                         (umo, platform, chat_type, title, session_key),
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM sessions WHERE session_key = ?", (session_key,)
+                    ).fetchone()
+                # 对方身份以「最新收到的」为准，但不要用空值覆盖已有值
+                new_peer_id = peer_id or str(row["peer_id"] or "")
+                new_peer_name = peer_name or str(row["peer_name"] or "")
+                if new_peer_id != str(row["peer_id"] or "") or new_peer_name != str(
+                    row["peer_name"] or ""
+                ):
+                    conn.execute(
+                        "UPDATE sessions SET peer_id = ?, peer_name = ?"
+                        " WHERE session_key = ?",
+                        (new_peer_id, new_peer_name, session_key),
                     )
                     row = conn.execute(
                         "SELECT * FROM sessions WHERE session_key = ?", (session_key,)
@@ -265,6 +296,8 @@ class Store:
             "atmosphere_data",
             "atmosphere_updated_at",
             "note",
+            "peer_id",
+            "peer_name",
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:

@@ -227,6 +227,8 @@ class ProactiveCompanionPlugin(Star):
         self._tracked_sessions: set[str] = set()
         # 最近一次主动回复判定结果，便于在面板上排查为什么没触发
         self._last_reply_decision: str = "尚未判定"
+        # 最近一次名单判定结果（私聊/群聊主动搭话），便于排查名单为什么没生效
+        self._last_whitelist_check: dict[str, Any] = {}
         # 各判定原因的跳过次数（面板上展示）
         self._reply_skip_reasons: dict[str, int] = {}
         # 气氛缓存：session_key -> Atmosphere（供同步过滤器快速读取）
@@ -739,6 +741,8 @@ class ProactiveCompanionPlugin(Star):
             event.get_platform_name() or "",
             self._chat_type(event),
             self._session_title(event),
+            sender_id,
+            sender,
         )
         self._tracked_sessions.add(umo)
         await self._record_user_message(umo, content, sender, sender_id)
@@ -855,12 +859,15 @@ class ProactiveCompanionPlugin(Star):
         umo = event.unified_msg_origin
         self._proactive_reply_times[umo] = time.time()
         chat_type = self._chat_type(event)
+        peer_id, peer_name = self._session_peer(event)
         await self.store.ensure_session(
             umo,
             umo,
             event.get_platform_name() or "",
             chat_type,
             self._session_title(event),
+            peer_id,
+            peer_name,
         )
         if not event.get_extra(_CAPTURED_FLAG, False):
             await self._record_user_message(
@@ -1124,6 +1131,21 @@ class ProactiveCompanionPlugin(Star):
             candidates.add(str(event.unified_msg_origin or ""))
         except Exception:
             pass
+        # 会话键按 ":" 拆开：平台前缀（aiocqhttp / telegram…）去掉之后
+        # 剩下的往往就是对方的用户 ID 或群号，填数字时靠它命中。
+        try:
+            umo = str(event.unified_msg_origin or "")
+            if ":" in umo:
+                candidates.update(part for part in umo.split(":") if part)
+        except Exception:
+            pass
+        # 平台昵称：即使消息没被采集，也能用当前事件里的昵称匹配
+        try:
+            sender_name = str(event.get_sender_name() or "")
+            if sender_name:
+                candidates.add(sender_name)
+        except Exception:
+            pass
         # 昵称：只匹配**当前发送者**的最新昵称。
         # （不能把会话里所有人的昵称都算进来，否则填了 A 的昵称会让 B 也能触发。）
         try:
@@ -1213,7 +1235,6 @@ class ProactiveCompanionPlugin(Star):
         chat_type = self._chat_type(event)
         title = self._session_title(event)
         platform = event.get_platform_name() or ""
-        await self.store.ensure_session(umo, umo, platform, chat_type, title)
 
         sender_name = event.get_sender_name() or ""
         sender_id = ""
@@ -1221,6 +1242,11 @@ class ProactiveCompanionPlugin(Star):
             sender_id = str(event.get_sender_id() or "")
         except Exception:
             sender_id = ""
+        # 把「这个会话的对方是谁」记下来：名单匹配要用它，
+        # 而且不能只在消息被采集时才记。
+        await self.store.ensure_session(
+            umo, umo, platform, chat_type, title, sender_id, sender_name
+        )
         now = time.time()
         update: dict[str, Any] = {"last_msg_at": now}
         if self._mentions_bot(event):
@@ -1587,11 +1613,153 @@ class ProactiveCompanionPlugin(Star):
 
     @staticmethod
     def _hit_any(items: list[str], candidates: set[str]) -> bool:
-        """名单是否命中候选集合（忽略大小写）。"""
+        """名单是否命中候选集合（忽略大小写）。
+
+        除了「完全相等」，纯数字的名单项还允许与候选里出现的数字串做包含匹配：
+        同一个人的标识在不同平台/不同会话里形态并不一样（`12345`、
+        `aiocqhttp:FriendMessage:12345`、`o.12345` 都可能指同一个人），
+        只做完全相等会让用户「明明填了 QQ 号却匹配不上」。
+        为避免误放行，数字匹配要求数字串长度至少 4 位，且候选的数字串
+        必须包含该数字段（前后可带其它字符）。
+        """
         if not items:
             return False
         lowered = {item.lower() for item in candidates if item}
-        return any(item in candidates or item.lower() in lowered for item in items)
+        for item in items:
+            if item in candidates or item.lower() in lowered:
+                return True
+            if item.isdigit() and len(item) >= 4:
+                for cand in candidates:
+                    if not cand:
+                        continue
+                    for part in re.findall(r"\d{4,}", cand):
+                        if item in part:
+                            return True
+        return False
+
+    def _record_whitelist_check(
+        self,
+        scope: str,
+        session: dict[str, Any],
+        *,
+        blacklist: list[str],
+        whitelist: list[str],
+        candidates: set[str],
+        details: list[str],
+        hit_blacklist: bool,
+        hit_whitelist: bool,
+    ) -> None:
+        """记录一次名单判定结果，便于在面板和指令里排查为什么没生效。"""
+        session_key = str(session.get("session_key") or "")
+        if hit_blacklist:
+            result = "命中黑名单"
+        elif hit_whitelist:
+            result = "命中白名单"
+        elif not whitelist or "*" in whitelist:
+            result = "未设名单（不限制）"
+        else:
+            result = "未命中白名单"
+        self._last_whitelist_check = {
+            "scope": scope,
+            "session_key": session_key,
+            "result": result,
+            "whitelist": list(whitelist),
+            "blacklist": list(blacklist),
+            "candidates": sorted(candidates)[:20],
+            "details": details,
+            "time": time.time(),
+        }
+
+    def _session_peer(self, event: AstrMessageEvent) -> tuple[str, str]:
+        """取事件的对方身份：(用户 ID, 昵称)。
+
+        私聊里这个用户 ID 就是对方（机器人自己不在其中），
+        名单功能要靠它匹配，所以**不依赖消息是否被采集**。
+        """
+        uid = ""
+        name = ""
+        try:
+            uid = str(event.get_sender_id() or "")
+        except Exception:  # pragma: no cover
+            uid = ""
+        try:
+            name = str(event.get_sender_name() or "")
+        except Exception:  # pragma: no cover
+            name = ""
+        return uid, name
+
+    async def _identity_candidates(
+        self, session: dict[str, Any]
+    ) -> tuple[set[str], list[str]]:
+        """收集一个会话可用于名单匹配的全部身份标识。
+
+        返回 (候选集合, 可读说明)。候选里包含：
+
+        - 会话 ID、会话键（umo）、会话标题（私聊里就是对方昵称）；
+        - 会话键按 `:` 拆开后的每一段（平台前缀也要去掉）；
+        - **会话对方身份**（`peer_id` / `peer_name`）：私聊里那个人的用户 ID
+          与昵称，这是最该被名单命中的东西；
+        - 该会话里出现过的所有发言人 ID 与昵称（消息被采集时才有）。
+
+        说明列表会展示在面板和 `/陪伴 名单` 里，用户照着填就不会再出现
+        「填了 QQ 号却匹配不上」的情况。
+        """
+        session_key = str(session.get("session_key") or "")
+        umo = str(session.get("umo") or session_key)
+        title = str(session.get("title") or "")
+        peer_id = str(session.get("peer_id") or "")
+        peer_name = str(session.get("peer_name") or "")
+        # 传入的会话信息里没有对方身份时，回库补一次
+        if session_key and not (peer_id or peer_name):
+            try:
+                stored = await self.store.get_session(session_key) or {}
+            except Exception:  # pragma: no cover
+                stored = {}
+            peer_id = str(stored.get("peer_id") or "")
+            peer_name = str(stored.get("peer_name") or "")
+            if not title:
+                title = str(stored.get("title") or "")
+
+        candidates: set[str] = {session_key, umo, title, peer_id, peer_name}
+        for raw in (session_key, umo):
+            if ":" in raw:
+                candidates.update(part for part in raw.split(":") if part)
+        details: list[str] = []
+        if peer_id or peer_name:
+            details.append(f"对方：{peer_name or '—'}（{peer_id or '无 ID'}）")
+        if session_key and session_key not in (peer_id,):
+            details.append(f"会话 ID：{session_key}")
+        if umo and umo != session_key:
+            details.append(f"会话键：{umo}")
+        if title and title not in (peer_name,):
+            details.append(f"会话标题：{title}")
+
+        # 消息被采集过时，会话里出现过的每个发言人也是身份线索
+        try:
+            names, last_id, last_name = await self._nickname_context(session_key)
+        except Exception:  # pragma: no cover
+            names, last_id, last_name = {}, "", ""
+        for uid, nick in names.items():
+            candidates.add(str(uid))
+            if nick:
+                candidates.add(str(nick))
+        if last_id:
+            candidates.add(str(last_id))
+        if last_name:
+            candidates.add(str(last_name))
+        try:
+            profiles = await self.store.list_profiles(session_key)
+        except Exception:  # pragma: no cover
+            profiles = []
+        for row in profiles:
+            uid = str(row.get("user_id") or "")
+            nick = str(row.get("nickname") or "").strip()
+            if uid:
+                candidates.add(uid)
+            if nick:
+                candidates.add(nick)
+        candidates = {c for c in candidates if c}
+        return candidates, details
 
     async def _private_whitelisted(self, session: dict[str, Any]) -> bool:
         """私聊主动搭话名单判定。
@@ -1608,54 +1776,53 @@ class ProactiveCompanionPlugin(Star):
         whitelist = self._cfg_list_names("private_proactive_whitelist")
         if not blacklist and (not whitelist or "*" in whitelist):
             return True
-        session_key = str(session.get("session_key") or "")
-        candidates: set[str] = {
-            session_key,
-            str(session.get("umo") or ""),
-        }
-        # 会话键形如「平台:类型:ID」，末段就是群号 / 用户 ID，
-        # 这样直接填「12345」也能命中，不用先知道完整的会话键。
-        if ":" in session_key:
-            candidates.add(session_key.rsplit(":", 1)[-1])
-        try:
-            names, peer_id, peer_name = await self._nickname_context(session_key)
-        except Exception:  # pragma: no cover
-            names, peer_id, peer_name = {}, "", ""
-        if peer_id:
-            candidates.add(peer_id)
-        if peer_name:
-            candidates.add(peer_name)
-        candidates.update(str(uid) for uid in names)
+        candidates, details = await self._identity_candidates(session)
+        hit_black = self._hit_any(blacklist, candidates)
+        hit_white = self._hit_any(whitelist, candidates)
+        self._record_whitelist_check(
+            "私聊主动搭话",
+            session,
+            blacklist=blacklist,
+            whitelist=whitelist,
+            candidates=candidates,
+            details=details,
+            hit_blacklist=hit_black,
+            hit_whitelist=hit_white,
+        )
         # 黑名单优先
-        if self._hit_any(blacklist, candidates):
+        if hit_black:
             return False
         if not whitelist or "*" in whitelist:
             return True
-        return self._hit_any(whitelist, candidates)
+        return hit_white
 
     async def _group_whitelisted(self, session: dict[str, Any]) -> bool:
         """群聊主动搭话名单判定（与私聊同样的黑名单优先规则）。
 
-        可填：群号、群会话 ID（umo）。留空或填 `*` = 不限制。
+        可填：群号、群会话 ID（umo）、群名。留空或填 `*` = 不限制。
         """
         blacklist = self._cfg_list_names("group_proactive_blacklist")
         whitelist = self._cfg_list_names("group_proactive_whitelist")
         if not blacklist and (not whitelist or "*" in whitelist):
             return True
-        candidates: set[str] = {
-            str(session.get("session_key") or ""),
-            str(session.get("umo") or ""),
-            str(session.get("title") or ""),
-        }
-        # 会话键末段就是群号，方便直接填「12345」
-        session_key = str(session.get("session_key") or "")
-        if ":" in session_key:
-            candidates.add(session_key.rsplit(":", 1)[-1])
-        if self._hit_any(blacklist, candidates):
+        candidates, details = await self._identity_candidates(session)
+        hit_black = self._hit_any(blacklist, candidates)
+        hit_white = self._hit_any(whitelist, candidates)
+        self._record_whitelist_check(
+            "群聊主动搭话",
+            session,
+            blacklist=blacklist,
+            whitelist=whitelist,
+            candidates=candidates,
+            details=details,
+            hit_blacklist=hit_black,
+            hit_whitelist=hit_white,
+        )
+        if hit_black:
             return False
         if not whitelist or "*" in whitelist:
             return True
-        return self._hit_any(whitelist, candidates)
+        return hit_white
 
     def _effective_limits(self, chat_type: str) -> dict[str, Any]:
         """按会话类型算出**实际生效**的阈值。
@@ -1935,6 +2102,53 @@ class ProactiveCompanionPlugin(Star):
         yield event.plain_result(text)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @companion.command("名单", alias={"wl", "whitelist", "名单管理"})
+    async def companion_whitelist(self, event: AstrMessageEvent):
+        """查看各套名单的当前内容，以及当前会话可以填进名单的身份标识"""
+        umo = event.unified_msg_origin
+        peer_id, peer_name = self._session_peer(event)
+        await self.store.ensure_session(
+            umo,
+            umo,
+            event.get_platform_name() or "",
+            self._chat_type(event),
+            self._session_title(event),
+            peer_id,
+            peer_name,
+        )
+        session = await self.store.get_session(umo) or {}
+        candidates, details = await self._identity_candidates(session)
+
+        def _fmt(key: str) -> str:
+            items = self._cfg_list_names(key)
+            return "、".join(items) if items else "（空 = 不限制）"
+
+        lines = [
+            "【当前名单】",
+            f"私聊主动搭话白名单：{_fmt('private_proactive_whitelist')}",
+            f"私聊主动搭话黑名单：{_fmt('private_proactive_blacklist')}",
+            f"群聊主动搭话白名单：{_fmt('group_proactive_whitelist')}",
+            f"群聊主动搭话黑名单：{_fmt('group_proactive_blacklist')}",
+            f"主动回复白名单：{_fmt('proactive_reply_whitelist')}",
+            f"主动回复黑名单：{_fmt('proactive_reply_blacklist')}",
+            "",
+            "【本会话可用于名单的身份标识】",
+        ]
+        lines.extend(f"- {d}" for d in details) if details else lines.append(
+            "- （暂无）"
+        )
+        lines.append(
+            "把上面任意一项填进对应名单即可命中（填昵称、用户 ID 或会话 ID 都行）。"
+        )
+        last = self._last_whitelist_check
+        if last:
+            lines.append("")
+            lines.append(
+                f"【最近一次名单判定】{last.get('scope', '')}：{last.get('result', '')}"
+            )
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("上下文", alias={"context", "ctx"})
     async def companion_context(self, event: AstrMessageEvent):
         """查看 / 开关当前会话的上下文注入"""
@@ -2051,6 +2265,30 @@ class ProactiveCompanionPlugin(Star):
             f"（0 = 不按时间清理）",
             f"最近判定：{self._last_reply_decision}",
         ]
+        # 名单相关的信息：排查「名单填了却没生效」
+        lines.append(
+            "私聊名单：白名单 "
+            f"{self._cfg_list('private_proactive_whitelist', []) or '（空 = 不限制）'}"
+            f"，黑名单 {self._cfg_list('private_proactive_blacklist', []) or '（空）'}"
+        )
+        lines.append(
+            "群聊名单：白名单 "
+            f"{self._cfg_list('group_proactive_whitelist', []) or '（空 = 不限制）'}"
+            f"，黑名单 {self._cfg_list('group_proactive_blacklist', []) or '（空）'}"
+        )
+        if session:
+            candidates, details = await self._identity_candidates(session)
+            lines.append(
+                "本会话可用身份标识：" + "；".join(details)
+                if details
+                else "本会话可用身份标识：（暂无）"
+            )
+            lines.append("全部候选：" + "、".join(sorted(candidates)[:12]))
+        last_wl = self._last_whitelist_check
+        if last_wl:
+            lines.append(
+                f"最近名单判定：{last_wl.get('scope', '')} → {last_wl.get('result', '')}"
+            )
         if self._reply_skip_reasons:
             top = sorted(
                 self._reply_skip_reasons.items(), key=lambda kv: kv[1], reverse=True
@@ -2966,6 +3204,23 @@ class ProactiveCompanionPlugin(Star):
                 "proactive_reply_whitelist": self._cfg_list(
                     "proactive_reply_whitelist", []
                 ),
+                # 名单现状与最近一次判定：排查「名单为什么没生效」
+                "private_proactive_whitelist": self._cfg_list(
+                    "private_proactive_whitelist", []
+                ),
+                "private_proactive_blacklist": self._cfg_list(
+                    "private_proactive_blacklist", []
+                ),
+                "group_proactive_whitelist": self._cfg_list(
+                    "group_proactive_whitelist", []
+                ),
+                "group_proactive_blacklist": self._cfg_list(
+                    "group_proactive_blacklist", []
+                ),
+                "proactive_reply_blacklist": self._cfg_list(
+                    "proactive_reply_blacklist", []
+                ),
+                "last_whitelist_check": dict(self._last_whitelist_check),
                 "proactive_replies_total": reply_total,
                 "proactive_reply_last_decision": self._last_reply_decision,
                 "proactive_reply_skip_reasons": dict(
@@ -3018,6 +3273,9 @@ class ProactiveCompanionPlugin(Star):
                 "atmosphere": state.to_dict() if state is not None else {},
                 "atmosphere_level": level,
                 "mentioned": self._mentioned_recently(s, time.time()),
+                # 对方身份：填名单时照着这个填就不会再匹配不上
+                "peer_id": str(s.get("peer_id") or ""),
+                "peer_name": str(s.get("peer_name") or ""),
             }
             if keyword:
                 haystack = f"{item['title']} {item['session_key']}".lower()

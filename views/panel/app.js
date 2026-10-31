@@ -160,6 +160,30 @@ async function loadState() {
     ["最近判定", data.proactive_reply_last_decision || "—"],
     ["跳过原因 TOP", skipReasons || "—"],
     [
+      "私聊名单",
+      `白名单：${
+        (data.private_proactive_whitelist || []).join("、") || "空 = 不限制"
+      }｜黑名单：${
+        (data.private_proactive_blacklist || []).join("、") || "空"
+      }`,
+    ],
+    [
+      "群聊名单",
+      `白名单：${
+        (data.group_proactive_whitelist || []).join("、") || "空 = 不限制"
+      }｜黑名单：${
+        (data.group_proactive_blacklist || []).join("、") || "空"
+      }`,
+    ],
+    [
+      "最近名单判定",
+      (() => {
+        const w = data.last_whitelist_check || {};
+        if (!w.scope) return "—";
+        return `${w.scope}：${w.result || "—"}`;
+      })(),
+    ],
+    [
       "上下文采集",
       `${data.capture_context_enabled ? "开" : "关"}（已跟踪 ${
         data.captured_sessions ?? 0
@@ -226,9 +250,13 @@ async function loadSessions() {
               : ""
           }`
         : "—";
+      const peerText = s.peer_id
+        ? `${s.peer_name || "—"}（${s.peer_id}）`
+        : s.peer_name || "—";
       return `<tr data-key="${esc(s.session_key)}">
         <td class="name" title="${esc(s.title || s.session_key)}">${esc(s.title || s.session_key)}</td>
         <td>${esc(chat)}${s.mentioned ? " <span class=\"badge\">@过我</span>" : ""}</td>
+        <td title="${esc(s.session_key || "")}">${esc(peerText)}</td>
         <td><span class="badge ${moodClass}">${esc(s.mood_label)}</span></td>
         <td><span class="badge ${airClass}" title="${esc(air.advice || "")}">${esc(airText)}</span></td>
         <td>${esc(s.messages_sent)}</td>
@@ -248,7 +276,7 @@ async function loadSessions() {
     })
     .join("");
   $("#session-rows").innerHTML =
-    rows || `<tr><td colspan="8" class="muted">暂无会话记录</td></tr>`;
+    rows || `<tr><td colspan="9" class="muted">暂无会话记录</td></tr>`;
 }
 
 async function sessionAction(key, act, btn) {

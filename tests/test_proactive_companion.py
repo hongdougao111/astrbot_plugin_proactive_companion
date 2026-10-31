@@ -1527,7 +1527,7 @@ async def main() -> None:
 
     # 23.6 指令仅限管理员使用
     cmds = getattr(plugin.companion, "commands", {})
-    check("指令组下有 13 条子指令", len(cmds) == 13, str(sorted(cmds)))
+    check("指令组下有 14 条子指令", len(cmds) == 14, str(sorted(cmds)))
     non_admin = [
         name
         for name, func in cmds.items()
@@ -2807,6 +2807,107 @@ async def main() -> None:
         "prompt 不同时历史保持原样",
         len(req7.contexts) == 2,
         str(req7.contexts),
+    )
+
+    print("\n== 34. 名单身份匹配加固 ==")
+
+    # 34.1 会话对方身份被单独记下来，不依赖消息是否被采集
+    peer_umo = "12345"
+    await plugin.store.ensure_session(
+        peer_umo, peer_umo, "aiocqhttp", "private", "对方昵称", "12345", "对方昵称"
+    )
+    peer_sess = await plugin.store.get_session(peer_umo)
+    check(
+        "会话记录了对方身份",
+        str((peer_sess or {}).get("peer_id") or "") == "12345"
+        and str((peer_sess or {}).get("peer_name") or "") == "对方昵称",
+        str(peer_sess),
+    )
+
+    # 34.2 白名单填对方的用户 ID 能命中（哪怕消息一条都没被采集）
+    plugin.config["private_proactive_whitelist"] = ["12345"]
+    check(
+        "私聊白名单按对方用户 ID 命中",
+        await plugin._private_whitelisted(
+            {"session_key": peer_umo, "umo": peer_umo, "chat_type": "private"}
+        ),
+    )
+
+    # 34.3 白名单填对方的昵称也能命中
+    plugin.config["private_proactive_whitelist"] = ["对方昵称"]
+    check(
+        "私聊白名单按对方昵称命中",
+        await plugin._private_whitelisted(
+            {"session_key": peer_umo, "umo": peer_umo, "chat_type": "private"}
+        ),
+    )
+
+    # 34.4 白名单填会话 ID 也能命中
+    plugin.config["private_proactive_whitelist"] = [peer_umo]
+    check(
+        "私聊白名单按会话 ID 命中",
+        await plugin._private_whitelisted(
+            {"session_key": peer_umo, "umo": peer_umo, "chat_type": "private"}
+        ),
+    )
+
+    # 34.5 别人的私聊不受影响
+    plugin.config["private_proactive_whitelist"] = ["12345"]
+    check(
+        "名单外的人依然被拦下",
+        not await plugin._private_whitelisted(
+            {"session_key": "99999", "umo": "99999", "chat_type": "private"}
+        ),
+    )
+
+    # 34.6 数字名单项能与带前缀的标识匹配（同一人的不同形态）
+    plugin.config["private_proactive_whitelist"] = ["12345"]
+    check(
+        "数字名单项能命中带前缀的标识",
+        await plugin._private_whitelisted(
+            {
+                "session_key": "aiocqhttp:FriendMessage:12345",
+                "umo": "aiocqhttp:FriendMessage:12345",
+                "chat_type": "private",
+            }
+        ),
+    )
+
+    # 34.7 太短的数字不会乱命中
+    plugin.config["private_proactive_whitelist"] = ["12"]
+    check(
+        "过短的数字不会误命中",
+        not await plugin._private_whitelisted(
+            {
+                "session_key": "aiocqhttp:FriendMessage:12345",
+                "umo": "aiocqhttp:FriendMessage:12345",
+                "chat_type": "private",
+            }
+        ),
+    )
+    plugin.config["private_proactive_whitelist"] = []
+
+    # 34.8 名单判定结果会被记录下来，方便排查
+    plugin.config["private_proactive_whitelist"] = ["12345"]
+    await plugin._private_whitelisted(
+        {"session_key": peer_umo, "umo": peer_umo, "chat_type": "private"}
+    )
+    diag = plugin._last_whitelist_check
+    check(
+        "记录了最近一次名单判定",
+        bool(diag) and diag.get("result") == "命中白名单",
+        str(diag),
+    )
+    plugin.config["private_proactive_whitelist"] = []
+
+    # 34.9 名单指令可用，并列出可用的身份标识
+    wl_res = await mock_await_result(
+        plugin.companion_whitelist(MockEvent(peer_umo, "陪伴 名单"))
+    )
+    check(
+        "名单指令有回复",
+        wl_res is not None and "名单" in wl_res[1],
+        str(wl_res),
     )
 
     shutil.rmtree(tmp, ignore_errors=True)
