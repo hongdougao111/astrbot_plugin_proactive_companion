@@ -1,4 +1,4 @@
-﻿# 主动陪伴 · astrbot_plugin_proactive_companion
+# 主动陪伴 · astrbot_plugin_proactive_companion
 
 让 Bot 在**私聊和群聊中主动发起消息**的 AstrBot 插件。
 
