@@ -530,6 +530,11 @@ A：`data/plugin_data/astrbot_plugin_proactive_companion/proactive.db`，不在�
 
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot) 及其插件生态
 - 插件可视化视图与 bridge SDK 规范（AstrBot 官方文档）
-- 贡献者：[yuanshen-nb111](https://github.com/yuanshen-nb111)（提出发送熔断方案）、
-  [Vine-0328](https://github.com/Vine-0328)、[XingYuZhiYuan](https://github.com/XingYuZhiYuan)、
+- 贡献者：
+
+  <a href="https://github.com/yuanshen-nb111" title="yuanshen-nb111"><img src="https://avatars.githubusercontent.com/u/351301486?v=4&s=96" width="64" height="64" alt="yuanshen-nb111"></a> <a href="https://github.com/Vine-0328" title="Vine-0328"><img src="https://avatars.githubusercontent.com/u/202887814?v=4&s=96" width="64" height="64" alt="Vine-0328"></a> <a href="https://github.com/XingYuZhiYuan" title="XingYuZhiYuan"><img src="https://avatars.githubusercontent.com/u/351306458?v=4&s=96" width="64" height="64" alt="XingYuZhiYuan"></a> <a href="https://github.com/MidNight072" title="行云流浪"><img src="https://avatars.githubusercontent.com/u/247589722?v=4&s=96" width="64" height="64" alt="行云流浪"></a>
+
+  [yuanshen-nb111](https://github.com/yuanshen-nb111)（提出发送熔断方案）｜
+  [Vine-0328](https://github.com/Vine-0328)｜
+  [XingYuZhiYuan](https://github.com/XingYuZhiYuan)｜
   [MidNight072](https://github.com/MidNight072)
