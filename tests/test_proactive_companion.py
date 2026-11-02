@@ -1527,7 +1527,7 @@ async def main() -> None:
 
     # 23.6 指令仅限管理员使用
     cmds = getattr(plugin.companion, "commands", {})
-    check("指令组下有 14 条子指令", len(cmds) == 14, str(sorted(cmds)))
+    check("指令组下有 15 条子指令", len(cmds) == 15, str(sorted(cmds)))
     non_admin = [
         name
         for name, func in cmds.items()
@@ -2909,6 +2909,140 @@ async def main() -> None:
         wl_res is not None and "名单" in wl_res[1],
         str(wl_res),
     )
+
+    print("\n== 35. 发送熔断（issue #2） ==")
+
+    # 35.1 平台返回 False（适配器静默失败）时，_deliver 必须判定为未送达
+    cb_umo = "aiocqhttp:FriendMessage:99999"
+    await plugin.store.ensure_session(
+        cb_umo, cb_umo, "aiocqhttp", "private", "对方", "99999", "对方"
+    )
+
+    async def silent_fail(session: str, chain: Any) -> bool:
+        # 模拟 aiocqhttp 适配器：既不抛异常，也不真正送达
+        return False
+
+    orig_send = ctx.send_message
+    ctx.send_message = silent_fail  # type: ignore[assignment]
+    delivered = await plugin._deliver(cb_umo, "在吗？")
+    check("平台返回 False 时判定为未送达", delivered is False, repr(delivered))
+
+    # 35.2 连续失败达到阈值 → 熔断
+    plugin.config["send_failure_threshold"] = 3
+    for _ in range(3):
+        await plugin._on_send_result(cb_umo, False)
+    cb_sess = await plugin.store.get_session(cb_umo) or {}
+    check(
+        "连续失败 3 次后熔断",
+        int(cb_sess.get("circuit_open") or 0) == 1
+        and int(cb_sess.get("send_fail_count") or 0) == 3,
+        str(cb_sess),
+    )
+
+    # 35.3 熔断期间不再生成文案（省 token）
+    cb_state = plugin._circuit_state(cb_sess, time.time())
+    check("熔断期间状态为 open", cb_state == "open", cb_state)
+    check(
+        "熔断期间不生成主动文案",
+        not await plugin._maybe_proactive(cb_sess, time.time()),
+    )
+
+    # 35.4 退避到期 → 半开，允许一次探测
+    half_sess = dict(cb_sess)
+    half_sess["circuit_until"] = time.time() - 1
+    check(
+        "退避到期后进入半开",
+        plugin._circuit_state(half_sess, time.time()) == "half_open",
+    )
+
+    # 35.5 退避是指数增长的
+    cfg = plugin._circuit_config()
+    backoff1 = plugin._circuit_backoff_seconds(3, cfg)
+    backoff2 = plugin._circuit_backoff_seconds(4, cfg)
+    check("失败越多退避越久", backoff2 > backoff1, f"{backoff1} -> {backoff2}")
+    check(
+        "退避不超过上限",
+        plugin._circuit_backoff_seconds(99, cfg)
+        <= cfg["max_minutes"] * 60 * (1 + cfg["jitter_ratio"]) + 1,
+        str(cfg),
+    )
+
+    # 35.6 发送成功 → 失败计数与熔断清空
+    await plugin._on_send_result(cb_umo, True)
+    ok_sess = await plugin.store.get_session(cb_umo) or {}
+    check(
+        "发送成功后清空失败计数与熔断",
+        int(ok_sess.get("send_fail_count") or 0) == 0
+        and int(ok_sess.get("circuit_open") or 0) == 0,
+        str(ok_sess),
+    )
+
+    # 35.7 收到入站消息 → 立即解除熔断（issue 的核心诉求）
+    await plugin._on_send_result(cb_umo, False)
+    await plugin._on_send_result(cb_umo, False)
+    await plugin._on_send_result(cb_umo, False)
+    broken = await plugin.store.get_session(cb_umo) or {}
+    check(
+        "再次熔断",
+        int(broken.get("circuit_open") or 0) == 1,
+        str(broken),
+    )
+    await plugin._clear_send_circuit(cb_umo)
+    cleared = await plugin.store.get_session(cb_umo) or {}
+    check(
+        "收到新消息后解除熔断",
+        int(cleared.get("send_fail_count") or 0) == 0
+        and int(cleared.get("circuit_open") or 0) == 0,
+        str(cleared),
+    )
+
+    # 35.8 失败 TTL：太久以前的失败不再计入连续失败
+    plugin.config["send_failure_ttl_minutes"] = 60
+    await plugin.store.update_session(
+        cb_umo, send_fail_count=2, circuit_open=0, fail_updated_at=time.time() - 7200
+    )
+    stale = await plugin.store.get_session(cb_umo) or {}
+    check(
+        "过期的失败记录不算连续失败",
+        plugin._circuit_state(stale, time.time()) == "closed",
+        str(stale),
+    )
+
+    # 35.9 熔断开关关掉后不再熔断
+    plugin.config["send_circuit_breaker_enabled"] = False
+    await plugin._on_send_result(cb_umo, False)
+    await plugin._on_send_result(cb_umo, False)
+    await plugin._on_send_result(cb_umo, False)
+    off_sess = await plugin.store.get_session(cb_umo) or {}
+    check(
+        "关闭熔断后不再触发",
+        int(off_sess.get("circuit_open") or 0) == 0,
+        str(off_sess),
+    )
+    plugin.config["send_circuit_breaker_enabled"] = True
+    plugin.config.pop("send_failure_threshold", None)
+    plugin.config.pop("send_failure_ttl_minutes", None)
+
+    # 35.10 熔断指令可用
+    cb_res = await mock_await_result(
+        plugin.companion_circuit(MockEvent(cb_umo, "陪伴 熔断"))
+    )
+    check("熔断指令有回复", cb_res is not None and "熔断" in cb_res[1], str(cb_res))
+
+    # 35.11 面板接口暴露熔断状态
+    request_holder["current"] = MockRequest()
+    request_holder["current"].set_query()
+    state_api = await plugin.api_state()
+    check(
+        "概览包含熔断统计",
+        "send_circuit_open_sessions" in state_api.payload,
+        str(state_api.payload)[:200],
+    )
+    sess_api = await plugin.api_sessions()
+    first = (sess_api.payload.get("sessions") or [{}])[0]
+    check("会话列表包含熔断状态", "circuit_state" in first, str(first)[:200])
+
+    ctx.send_message = orig_send  # type: ignore[assignment]
 
     shutil.rmtree(tmp, ignore_errors=True)
 

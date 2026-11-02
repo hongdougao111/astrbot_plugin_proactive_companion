@@ -72,6 +72,12 @@ const CONFIG_FIELDS = [
   { key: "context_max_message_chars", label: "单条消息注入长度上限", type: "int", min: 20 },
   { key: "context_blocked_keywords", label: "上下文屏蔽词", type: "text", list: true, hint: "命中的消息不注入给模型；逗号分隔" },
   { key: "dedupe_llm_context_enabled", label: "去除会话历史中的重复消息", type: "bool", hint: "平台重复投递时，模型会以为「对方连着说了好几遍」，甚至在回复里说出来" },
+  { key: "send_circuit_breaker_enabled", label: "启用发送熔断", type: "bool", hint: "连续发不出去（适配器静默失败）时自动停用该会话的主动发言，避免反复重试白烧 token" },
+  { key: "send_failure_threshold", label: "连续失败多少次触发熔断", type: "int", min: 1 },
+  { key: "send_circuit_base_minutes", label: "熔断首次退避(分钟)", type: "int", min: 1 },
+  { key: "send_circuit_max_minutes", label: "熔断最长退避(分钟)", type: "int", min: 1 },
+  { key: "send_circuit_jitter_ratio", label: "退避抖动比例", type: "float", min: 0, hint: "0 = 不抖动；0.2 = 实际退避在基准值的 80%~120% 之间，避免所有会话同时重试" },
+  { key: "send_failure_ttl_minutes", label: "失败记录有效期(分钟)", type: "int", min: 1, hint: "超过这个时间的失败不再计入「连续失败」" },
   { key: "atmosphere_enabled", label: "启用读空气", type: "bool" },
   { key: "atmosphere_window_minutes", label: "气氛判断窗口(分钟)", type: "int", min: 1 },
   { key: "atmosphere_refresh_minutes", label: "气氛刷新间隔(分钟)", type: "int", min: 1 },
@@ -253,6 +259,18 @@ async function loadSessions() {
       const peerText = s.peer_id
         ? `${s.peer_name || "—"}（${s.peer_id}）`
         : s.peer_name || "—";
+      const circuitBadge =
+        s.circuit_state === "open"
+          ? ` <span class="badge bad" title="连续发送失败 ${s.send_fail_count} 次，已停用主动发言；退避结束后自动重试">熔断</span>`
+          : s.circuit_state === "half_open"
+            ? ` <span class="badge" title="退避结束，等待一次探测性发送">半开</span>`
+            : s.send_fail_count > 0
+              ? ` <span class="badge" title="已发送失败 ${s.send_fail_count} 次">失败${s.send_fail_count}</span>`
+              : "";
+      const resetBtn =
+        s.send_fail_count > 0 || s.circuit_state !== "closed"
+          ? `<button class="btn tiny ghost" data-act="reset-circuit">解除熔断</button>`
+          : "";
       return `<tr data-key="${esc(s.session_key)}">
         <td class="name" title="${esc(s.title || s.session_key)}">${esc(s.title || s.session_key)}</td>
         <td>${esc(chat)}${s.mentioned ? " <span class=\"badge\">@过我</span>" : ""}</td>
@@ -261,11 +279,12 @@ async function loadSessions() {
         <td><span class="badge ${airClass}" title="${esc(air.advice || "")}">${esc(airText)}</span></td>
         <td>${esc(s.messages_sent)}</td>
         <td>${esc(s.daily_count)}</td>
-        <td><span class="badge ${s.enabled ? "good" : "bad"}">${s.enabled ? "开启" : "关闭"}</span></td>
+        <td><span class="badge ${s.enabled ? "good" : "bad"}">${s.enabled ? "开启" : "关闭"}</span>${circuitBadge}</td>
         <td>
           <div class="row-actions">
             <button class="btn tiny ghost" data-act="toggle">${s.enabled ? "关闭" : "开启"}</button>
             <button class="btn tiny ghost" data-act="send">立即发送</button>
+            ${resetBtn}
             <button class="btn tiny ghost" data-act="mood">重置情绪</button>
             <button class="btn tiny ghost" data-act="messages">记录</button>
             <button class="btn tiny ghost danger" data-act="clear-memory">清记忆</button>
@@ -292,6 +311,9 @@ async function sessionAction(key, act, btn) {
     } else if (act === "mood") {
       await bridge.apiPost("sessions/reset_mood", { session_key: key });
       toast("情绪已重置");
+    } else if (act === "reset-circuit") {
+      await bridge.apiPost("sessions/reset_circuit", { session_key: key });
+      toast("已解除该会话的发送熔断");
     } else if (act === "messages") {
       await loadMessages(key);
       return;

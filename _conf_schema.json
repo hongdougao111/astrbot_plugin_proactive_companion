@@ -353,5 +353,41 @@
     "type": "bool",
     "default": true,
     "hint": "记录 Bot 与每个用户的长期关系（好感度），关系越好越愿意主动搭话。"
+  },
+  "send_circuit_breaker_enabled": {
+    "description": "启用发送熔断",
+    "type": "bool",
+    "default": true,
+    "hint": "连续发不出去（适配器静默失败）时自动停用该会话的主动发言，避免反复重试白烧 token"
+  },
+  "send_failure_threshold": {
+    "description": "连续失败多少次触发熔断",
+    "type": "int",
+    "default": 3,
+    "hint": "默认 3 次。达到后该会话不再主动发言，也不会再生成文案"
+  },
+  "send_circuit_base_minutes": {
+    "description": "熔断首次退避（分钟）",
+    "type": "int",
+    "default": 30,
+    "hint": "第一次熔断后等待多久再重试，之后按指数增长"
+  },
+  "send_circuit_max_minutes": {
+    "description": "熔断最长退避（分钟）",
+    "type": "int",
+    "default": 720,
+    "hint": "退避上限，默认 12 小时"
+  },
+  "send_circuit_jitter_ratio": {
+    "description": "退避抖动比例",
+    "type": "float",
+    "default": 0.2,
+    "hint": "0 = 不抖动；0.2 = 实际退避在基准值的 80%~120% 之间，避免所有会话同时重试"
+  },
+  "send_failure_ttl_minutes": {
+    "description": "失败记录有效期（分钟）",
+    "type": "int",
+    "default": 60,
+    "hint": "超过这个时间的失败不再计入「连续失败」"
   }
 }

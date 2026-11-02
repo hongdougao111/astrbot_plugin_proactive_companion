@@ -53,7 +53,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at      REAL NOT NULL DEFAULT 0,
     note            TEXT DEFAULT '',
     peer_id         TEXT DEFAULT '',
-    peer_name       TEXT DEFAULT ''
+    peer_name       TEXT DEFAULT '',
+    send_fail_count INTEGER NOT NULL DEFAULT 0,
+    circuit_open    INTEGER NOT NULL DEFAULT 0,
+    circuit_until   REAL NOT NULL DEFAULT 0,
+    fail_updated_at REAL NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -152,6 +156,12 @@ class Store:
                 # 没被采集的会话同样要能按对方身份命中名单。
                 "peer_id": "TEXT DEFAULT ''",
                 "peer_name": "TEXT DEFAULT ''",
+                # 发送失败计数与熔断状态：连续发不出去时自动停用，
+                # 避免对着发不出去的会话一次次重试、白白消耗 token。
+                "send_fail_count": "INTEGER NOT NULL DEFAULT 0",
+                "circuit_open": "INTEGER NOT NULL DEFAULT 0",
+                "circuit_until": "REAL NOT NULL DEFAULT 0",
+                "fail_updated_at": "REAL NOT NULL DEFAULT 0",
             },
             "messages": {
                 "sender_id": "TEXT DEFAULT ''",
@@ -298,6 +308,10 @@ class Store:
             "note",
             "peer_id",
             "peer_name",
+            "send_fail_count",
+            "circuit_open",
+            "circuit_until",
+            "fail_updated_at",
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:

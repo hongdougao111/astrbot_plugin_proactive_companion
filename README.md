@@ -72,6 +72,7 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 | `/陪伴 改画像 <用户ID> 备注=xxx 标签=a,b 好感=60` | 修改画像；也可用 `昵称=` |
 | `/陪伴 重建画像` | 用历史聊天记录重新补全人物画像 |
 | `/陪伴 清除记忆` | 一键清除记忆：当前会话 / 某人 / 全部 / 只清画像 |
+| `/陪伴 熔断` | 查看发送熔断状态；`/陪伴 熔断 解除` 手动解除当前会话 |
 
 > ⚠️ 以上指令**仅限管理员使用**（AstrBot 后台「管理员」名单内的用户才能触发）。
 
@@ -118,13 +119,19 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 | `tts_enabled` | `false` | 是否把主动消息转成语音 |
 | `tts_provider_id` | `""` | 指定 TTS 提供商，留空用会话默认 |
 | `system_prompt` | 见配置面板 | 主动消息的人设提示词 |
+| `send_circuit_breaker_enabled` | `true` | 启用发送熔断：连续发不出去时自动停用该会话的主动发言 |
+| `send_failure_threshold` | `3` | 连续发送失败多少次后触发熔断 |
+| `send_circuit_base_minutes` | `30` | 熔断后的首次退避（分钟），之后按指数增长 |
+| `send_circuit_max_minutes` | `720` | 退避上限（分钟，默认 12 小时） |
+| `send_circuit_jitter_ratio` | `0.2` | 退避抖动比例，避免所有会话同时重试 |
+| `send_failure_ttl_minutes` | `60` | 失败记录有效期，超过则不再计入「连续失败」 |
 
 ## 🖥️ 可视化面板
 
 插件在 WebUI 中注册了一个名为 **panel** 的视图（插件详情页 → 可视化视图），包含：
 
 - **概览**：运行状态、免打扰时段、平均情绪、今日发送量、调度器健康度
-- **会话**：搜索、单独开关、立即发送、重置情绪、查看消息记录、删除会话
+- **会话**：搜索、单独开关、立即发送、重置情绪、查看消息记录、删除会话；发送失败的会话会显示「熔断」徽标，可一键解除
 - **配置**：可视化编辑全部运行参数并即时保存
 - **日志**：最近事件流，以及一键导出全量 JSON 数据
 
@@ -151,9 +158,29 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 python tests/test_proactive_companion.py
 ```
 
-当前结果：**315 项断言全部通过**（另有一份发布前体检脚本，覆盖市场规范/配置类型/包内容检查）。
+当前结果：**330 项断言全部通过**（另有一份发布前体检脚本，覆盖市场规范/配置类型/包内容检查）。
 
 ## 📋 更新日志
+
+### v1.2.10
+
+- **修复：消息发不出去时，机器人会一直重试、白烧 token**（issue #2）。
+  此前 `send_by_session()` 一类适配器在「会话被改写成 `bridge_<群号>`」时
+  **既不抛异常也不送达**，而插件忽略了返回值，误以为消息已发出，
+  于是下一轮又生成一条文案、再发一次——连续重试几百次。现在：
+  - **发送结果会被检查**：平台明确返回失败即判定为未送达，
+    不再把「以为发出去了」当成「发出去了」。
+  - **失败自动熔断**：同一会话连续失败达到阈值（默认 3 次）后，
+    自动停用该会话的主动发言，**而且不再生成文案**（生成要走 LLM，直接省下 token）。
+  - **指数退避 + 半开探测**：熔断后按 30 分钟 → 1 小时 → 2 小时 … 逐步退避
+    （上限 12 小时，带抖动避免所有会话同时重试）；退避到期进入半开，
+    允许一次探测性发送，成功即完全恢复，失败则继续退避。
+  - **失败记录有 TTL**：超过有效期（默认 60 分钟）的失败不再计入「连续失败」。
+  - **收到新消息立即恢复**：该会话再次收到入站消息时，熔断立刻解除并清零计数。
+  - **看得见、管得住**：面板会话列表新增「熔断」徽标与「解除熔断」按钮，
+    概览新增熔断统计；新增指令 `/陪伴 熔断`（别名 `/陪伴 cb`）可查看全部熔断会话，
+    `/陪伴 熔断 解除` / `/陪伴 熔断 全部解除` 手动解除；
+    `/陪伴 状态` 与 `/陪伴 诊断` 也会显示熔断状态。
 
 ### v1.2.9
 
@@ -503,3 +530,5 @@ A：`data/plugin_data/astrbot_plugin_proactive_companion/proactive.db`，不在�
 
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot) 及其插件生态
 - 插件可视化视图与 bridge SDK 规范（AstrBot 官方文档）
+- 贡献者：[yuanshen-nb111](https://github.com/yuanshen-nb111)（提出发送熔断方案）、
+  [Vine-0328](https://github.com/Vine-0328)、[XingYuZhiYuan](https://github.com/XingYuZhiYuan)

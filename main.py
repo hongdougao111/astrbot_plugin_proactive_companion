@@ -113,6 +113,14 @@ SAFE_DEFAULTS: dict[str, Any] = {
     # 去掉 LLM 请求历史里重复的消息：平台重复投递时，模型会以为
     # 「对方连着说了好几遍」，甚至在回复里直接说出来。
     "dedupe_llm_context_enabled": True,
+    # 发送熔断：连续发不出去（适配器静默失败 / 群号被当成 QQ 号）时
+    # 自动停用该会话的主动发言，避免一轮轮重试、白白烧 token。
+    "send_circuit_breaker_enabled": True,
+    "send_failure_threshold": 3,
+    "send_circuit_base_minutes": 30,
+    "send_circuit_max_minutes": 720,
+    "send_circuit_jitter_ratio": 0.2,
+    "send_failure_ttl_minutes": 60,
     "atmosphere_enabled": True,
     "atmosphere_window_minutes": 30,
     "atmosphere_refresh_minutes": 3,
@@ -236,6 +244,9 @@ class ProactiveCompanionPlugin(Star):
         self._atmosphere_refreshed_at: dict[str, float] = {}
         # 好感度缓存：session_key|user_id -> 分数（供同步过滤器快速读取）
         self._affection_cache: dict[str, float] = {}
+        # 发送失败 / 熔断过的会话（内存索引）：收到新消息时用来快速判断
+        # 是否需要解除熔断，避免每条消息都去查库。
+        self._send_fail_sessions: set[str] = set()
         global _PLUGIN_REF
         _PLUGIN_REF = self
         self._register_web_apis()
@@ -664,6 +675,9 @@ class ProactiveCompanionPlugin(Star):
     # ------------------------------------------------------------------
     def capture_message_background(self, event: AstrMessageEvent) -> None:
         """被动记录收到的消息，供上下文感知使用（不阻塞消息处理）。"""
+        # 收到该会话的新消息 → 立即解除发送熔断（对应 issue #2 的期望：
+        # 「连续失败 ≥3 次自动停用直到收到新消息」）。
+        self._clear_circuit_background(event)
         if not self._cfg_bool("capture_context_enabled", True):
             return
         if not self._cfg_bool("enabled", True):
@@ -688,6 +702,20 @@ class ProactiveCompanionPlugin(Star):
     # 用户消息的入库去重窗口（秒）：同一会话、同一发送者、同一内容在这个
     # 窗口内只会入库一次，防止一句话被记成两三句。
     _USER_DEDUPE_WINDOW = 30.0
+
+    def _clear_circuit_background(self, event: AstrMessageEvent) -> None:
+        """收到入站消息时异步解除该会话的发送熔断（不阻塞消息处理）。"""
+        try:
+            umo = str(event.unified_msg_origin or "")
+        except Exception:  # pragma: no cover
+            return
+        if not umo or umo not in self._send_fail_sessions:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - 非异步环境
+            return
+        loop.create_task(self._clear_send_circuit(umo))
 
     async def _record_user_message(
         self,
@@ -1472,6 +1500,21 @@ class ProactiveCompanionPlugin(Star):
             return False
         if not int(session.get("enabled") or 0):
             return False
+        # 发送熔断：连续发不出去的会话不再主动发言，
+        # 也不会再生成文案（生成要走 LLM，白白烧 token）。
+        # 退避到期后进入半开状态，允许一次探测性发送：
+        # 成功就完全恢复，失败则继续退避。
+        circuit_state = self._circuit_state(session, now)
+        if circuit_state == "open":
+            return False
+        if circuit_state == "half_open":
+            await self.store.update_session(
+                session_key,
+                circuit_until=now
+                + self._circuit_backoff_seconds(
+                    int(session.get("send_fail_count") or 0), self._circuit_config()
+                ),
+            )
 
         chat_type = str(session.get("chat_type") or "")
         is_private = chat_type == "private"
@@ -1563,6 +1606,7 @@ class ProactiveCompanionPlugin(Star):
             return False
 
         sent = await self._deliver(session_key, text)
+        await self._on_send_result(session_key, sent)
         if not sent:
             return False
 
@@ -1970,8 +2014,151 @@ class ProactiveCompanionPlugin(Star):
             return None
         return provider
 
+    async def _on_send_result(self, umo: str, ok: bool) -> None:
+        """记录一次主动消息的发送结果，并在连续失败时熔断该会话。
+
+        连续失败达到阈值后，本会话不再主动发言（也不再生成文案，省 token）。
+        熔断采用**指数退避**：每次失败把下一次允许重试的时间往后推，
+        上限由「发送熔断最长退避」控制；退避到期后进入**半开**状态，
+        允许一次探测性发送，成功就完全恢复，失败则继续退避。
+        此外失败记录有 TTL：太久以前的失败不再计入连续失败数。
+        """
+        if not umo:
+            return
+        if not self._cfg_bool("send_circuit_breaker_enabled", True):
+            return
+        cfg = self._circuit_config()
+        try:
+            session = await self.store.get_session(umo) or {}
+        except Exception:  # pragma: no cover
+            session = {}
+        fails = int(session.get("send_fail_count") or 0)
+        now = time.time()
+        # 失败 TTL：超过 TTL 的失败记录不再计入「连续失败」
+        last_fail = float(session.get("fail_updated_at") or 0)
+        if last_fail and (now - last_fail) > cfg["ttl_seconds"]:
+            fails = 0
+        if ok:
+            if fails or int(session.get("circuit_open") or 0):
+                await self.store.update_session(
+                    umo,
+                    send_fail_count=0,
+                    circuit_open=0,
+                    circuit_until=0,
+                    fail_updated_at=0,
+                )
+                self._send_fail_sessions.discard(umo)
+                logger.info(f"[主动陪伴] 会话 {umo} 发送恢复，已清空失败计数")
+            return
+        fails += 1
+        circuit = False
+        circuit_until = 0.0
+        if fails >= cfg["threshold"]:
+            circuit = True
+            circuit_until = now + self._circuit_backoff_seconds(fails, cfg)
+        if circuit and not int(session.get("circuit_open") or 0):
+            logger.warning(
+                f"[主动陪伴] 会话 {umo} 连续 {fails} 次发送失败，已熔断自动停用"
+                f"（约 {round((circuit_until - now) / 60)} 分钟后半开重试；"
+                "收到该会话的新消息会立即恢复）"
+            )
+            await self.store.add_event(
+                "send_circuit_open",
+                umo,
+                {
+                    "failures": fails,
+                    "threshold": cfg["threshold"],
+                    "retry_after_minutes": round((circuit_until - now) / 60),
+                },
+            )
+        self._send_fail_sessions.add(umo)
+        await self.store.update_session(
+            umo,
+            send_fail_count=fails,
+            circuit_open=1 if circuit else 0,
+            circuit_until=circuit_until,
+            fail_updated_at=now,
+        )
+
+    async def _clear_send_circuit(self, umo: str) -> None:
+        """收到该会话的新消息 → 解除熔断（失败计数一并清零）。"""
+        if not umo:
+            return
+        self._send_fail_sessions.discard(umo)
+        try:
+            session = await self.store.get_session(umo) or {}
+        except Exception:  # pragma: no cover
+            session = {}
+        if (
+            not int(session.get("send_fail_count") or 0)
+            and not int(session.get("circuit_open") or 0)
+            and not float(session.get("circuit_until") or 0)
+        ):
+            return
+        await self.store.update_session(
+            umo,
+            send_fail_count=0,
+            circuit_open=0,
+            circuit_until=0,
+            fail_updated_at=0,
+        )
+        logger.info(f"[主动陪伴] 会话 {umo} 收到新消息，已解除发送熔断")
+
+    def _circuit_config(self) -> dict[str, Any]:
+        """熔断相关配置。"""
+        base = max(1.0, self._cfg_float("send_circuit_base_minutes", 30))
+        maximum = max(base, self._cfg_float("send_circuit_max_minutes", 720))
+        return {
+            "enabled": self._cfg_bool("send_circuit_breaker_enabled", True),
+            "threshold": max(1, self._cfg_int("send_failure_threshold", 3)),
+            "base_minutes": base,
+            "max_minutes": maximum,
+            "jitter_ratio": max(0.0, self._cfg_float("send_circuit_jitter_ratio", 0.2)),
+            "ttl_seconds": max(1, self._cfg_int("send_failure_ttl_minutes", 60)) * 60,
+        }
+
+    def _circuit_backoff_seconds(self, fails: int, cfg: dict[str, Any]) -> float:
+        """第 fails 次失败后的退避时长（秒）：指数退避 + 抖动。"""
+        exponent = max(0, int(fails) - int(cfg["threshold"]))
+        minutes = float(cfg["base_minutes"]) * (2**exponent)
+        minutes = min(minutes, float(cfg["max_minutes"]))
+        jitter = float(cfg["jitter_ratio"])
+        if jitter > 0:
+            # 抖动避免所有会话在同一时刻集中重试
+            minutes *= 1 + random.uniform(-jitter, jitter)
+        return max(60.0, minutes * 60)
+
+    def _circuit_state(self, session: dict[str, Any], now: float) -> str:
+        """判断某个会话当前的熔断状态。
+
+        返回 ``closed``（正常）、``open``（退避中，禁止发送）、
+        ``half_open``（退避到期，允许一次探测性发送）。
+        """
+        cfg = self._circuit_config()
+        if not cfg["enabled"]:
+            return "closed"
+        fails = int(session.get("send_fail_count") or 0)
+        if fails <= 0:
+            return "closed"
+        last_fail = float(session.get("fail_updated_at") or 0)
+        if last_fail and (now - last_fail) > cfg["ttl_seconds"]:
+            # 失败记录已过期，等同于没有失败
+            return "closed"
+        if not int(session.get("circuit_open") or 0):
+            return "closed"
+        until = float(session.get("circuit_until") or 0)
+        if until and now < until:
+            return "open"
+        return "half_open"
+
     async def _deliver(self, umo: str, text: str) -> bool:
-        """发送主动消息（含可选 TTS 语音）。"""
+        """发送主动消息（含可选 TTS 语音）。
+
+        返回 True 表示**确实发出去了**。这里必须检查平台侧的返回值：
+        有些适配器（例如会话桥接把私聊会话写成 `bridge_<群号>` 的情况）
+        不会抛异常，只是返回 False —— 早期版本忽略返回值，
+        于是插件以为消息已送达，于是一轮轮重试，白白烧 token。
+        """
         chain = MessageChain()
         chain.message(text)
 
@@ -1986,16 +2173,26 @@ class ProactiveCompanionPlugin(Star):
                     if str(getattr(comp, "type", "")).lower() != "plain"
                 ]
         try:
-            await self.context.send_message(umo, chain)
+            result = await self.context.send_message(umo, chain)
         except Exception as exc:
             logger.warning(f"[主动陪伴] 发送主动消息失败({umo}): {exc}")
             if voice_path:
                 # 语音消息发送失败时，退化为纯文本再试一次
                 try:
-                    await self.context.send_message(umo, MessageChain().message(text))
-                    return True
+                    fallback = await self.context.send_message(
+                        umo, MessageChain().message(text)
+                    )
+                    if fallback is not False:
+                        return True
+                    logger.warning(
+                        f"[主动陪伴] 文本兜底发送未成功({umo}): 平台返回失败"
+                    )
                 except Exception as exc2:
                     logger.warning(f"[主动陪伴] 文本兜底发送同样失败({umo}): {exc2}")
+            return False
+        # 平台明确返回 False 表示没发出去（不抛异常的情况）
+        if result is False:
+            logger.warning(f"[主动陪伴] 平台返回发送失败({umo})，判定为未送达")
             return False
         return True
 
@@ -2099,6 +2296,16 @@ class ProactiveCompanionPlugin(Star):
         if chat_type == "private":
             wl = self._cfg_list("private_proactive_whitelist", [])
             text += f"\n私聊白名单：{'、'.join(str(w) for w in wl) if wl else '（未设置 = 不限制）'}"
+        circuit_state = self._circuit_state(session, time.time())
+        if circuit_state != "closed":
+            fails = int(session.get("send_fail_count") or 0)
+            until = float(session.get("circuit_until") or 0)
+            left = max(0, int((until - time.time()) / 60)) if until else 0
+            text += (
+                f"\n发送熔断：{'退避中' if circuit_state == 'open' else '半开待探测'}"
+                f"（连续失败 {fails} 次，{left} 分钟后重试；"
+                "收到本会话的新消息会立即恢复）"
+            )
         yield event.plain_result(text)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -2216,6 +2423,7 @@ class ProactiveCompanionPlugin(Star):
             yield event.plain_result("我暂时没什么想说的～")
             return
         sent = await self._deliver(umo, text)
+        await self._on_send_result(umo, sent)
         if sent:
             await self.store.add_message(
                 umo, "proactive", text, "bot", "", dedupe_window=10.0
@@ -2311,6 +2519,20 @@ class ProactiveCompanionPlugin(Star):
             lines.append(f"建议：{state.advice}")
         else:
             lines.append("气氛：暂无数据（读空气已关闭或还没算过）")
+        # 发送熔断：排查「为什么不主动搭话了」
+        circuit_cfg = self._circuit_config()
+        circuit_state = self._circuit_state(session or {}, time.time())
+        circuit_label = {
+            "closed": "正常",
+            "open": "熔断中（退避等待）",
+            "half_open": "半开（等待一次探测）",
+        }.get(circuit_state, "正常")
+        lines.append(
+            f"发送熔断：{circuit_label}"
+            f"（连续失败 {int((session or {}).get('send_fail_count') or 0)} 次，"
+            f"阈值 {circuit_cfg['threshold']}，"
+            f"退避 {circuit_cfg['base_minutes']:.0f}→{circuit_cfg['max_minutes']:.0f} 分钟）"
+        )
         # 画像相关的信息：方便确认「改了为什么没生效」
         try:
             all_profiles = await self.store.list_profiles(None)
@@ -2403,6 +2625,73 @@ class ProactiveCompanionPlugin(Star):
                     item.get("user_id") or ""
                 )
         return None
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @companion.command("熔断", alias={"cb", "circuit", "断路器"})
+    async def companion_circuit(self, event: AstrMessageEvent):
+        """查看发送熔断状态，或手动解除熔断。
+
+        用法：
+        - `/陪伴 熔断` —— 列出当前所有发送失败的会话
+        - `/陪伴 熔断 解除` —— 解除当前会话的熔断
+        - `/陪伴 熔断 全部解除` —— 解除所有会话的熔断
+        """
+        umo = event.unified_msg_origin
+        tail = self._cmd_tail(event, "熔断", "cb", "circuit", "断路器").strip()
+        if tail in ("解除", "重置", "reset", "clear"):
+            await self._clear_send_circuit(umo)
+            await self.store.add_event("send_circuit_reset", umo, {"by": "command"})
+            yield event.plain_result("已解除本会话的发送熔断。")
+            return
+        if tail in ("全部解除", "全部", "all"):
+            sessions = await self.store.list_sessions()
+            count = 0
+            for s in sessions:
+                key = str(s.get("session_key") or "")
+                if not key:
+                    continue
+                if int(s.get("send_fail_count") or 0) or int(
+                    s.get("circuit_open") or 0
+                ):
+                    await self._clear_send_circuit(key)
+                    count += 1
+            await self.store.add_event(
+                "send_circuit_reset", "", {"by": "command", "all": True}
+            )
+            yield event.plain_result(f"已解除 {count} 个会话的发送熔断。")
+            return
+
+        sessions = await self.store.list_sessions()
+        now = time.time()
+        lines = ["【发送熔断状态】"]
+        listed = 0
+        for s in sessions:
+            fails = int(s.get("send_fail_count") or 0)
+            state = self._circuit_state(s, now)
+            if not fails and state == "closed":
+                continue
+            listed += 1
+            until = float(s.get("circuit_until") or 0)
+            left = max(0, int((until - now) / 60)) if until else 0
+            label = {
+                "open": "退避中",
+                "half_open": "半开待探测",
+                "closed": "未熔断",
+            }.get(state, state)
+            lines.append(
+                f"- {s.get('title') or s.get('session_key')}"
+                f"｜{label}｜连续失败 {fails} 次"
+                + (f"｜{left} 分钟后重试" if state == "open" else "")
+            )
+        if not listed:
+            lines.append("- （当前没有发送失败的会话）")
+        else:
+            lines.append("")
+            lines.append("发送失败会自动停用该会话的主动发言；")
+            lines.append(
+                "用 `/陪伴 熔断 解除` 解除当前会话，`/陪伴 熔断 全部解除` 全部解除。"
+            )
+        yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @companion.command("好感", alias={"affection", "好感度"})
@@ -2865,6 +3154,12 @@ class ProactiveCompanionPlugin(Star):
             "开关会话主动消息",
         )
         ctx.register_web_api(
+            f"/{PLUGIN_NAME}/sessions/reset_circuit",
+            self.api_reset_circuit,
+            ["POST"],
+            "手动解除会话的发送熔断",
+        )
+        ctx.register_web_api(
             f"/{PLUGIN_NAME}/messages/dedupe",
             self.api_dedupe_messages,
             ["POST"],
@@ -3240,6 +3535,19 @@ class ProactiveCompanionPlugin(Star):
                 "keep_messages_days": self._cfg_int("keep_messages_days", 30),
                 "atmosphere_enabled": self._cfg_bool("atmosphere_enabled", True),
                 "atmosphere_levels": self._atmosphere_levels(),
+                # 发送熔断现状：连不上（发不出去）的会话有多少个
+                "send_circuit_breaker_enabled": self._cfg_bool(
+                    "send_circuit_breaker_enabled", True
+                ),
+                "send_failure_threshold": max(
+                    1, self._cfg_int("send_failure_threshold", 3)
+                ),
+                "send_circuit_open_sessions": len(
+                    [s for s in sessions if self._circuit_state(s, now) == "open"]
+                ),
+                "send_fail_sessions": len(
+                    [s for s in sessions if int(s.get("send_fail_count") or 0) > 0]
+                ),
                 "data_dir": str(self.data_dir),
                 "server_time": now,
             }
@@ -3276,6 +3584,10 @@ class ProactiveCompanionPlugin(Star):
                 # 对方身份：填名单时照着这个填就不会再匹配不上
                 "peer_id": str(s.get("peer_id") or ""),
                 "peer_name": str(s.get("peer_name") or ""),
+                # 发送熔断状态：发不出去的会话会在这里显示出来
+                "send_fail_count": int(s.get("send_fail_count") or 0),
+                "circuit_state": self._circuit_state(s, time.time()),
+                "circuit_until": float(s.get("circuit_until") or 0),
             }
             if keyword:
                 haystack = f"{item['title']} {item['session_key']}".lower()
@@ -3285,6 +3597,19 @@ class ProactiveCompanionPlugin(Star):
         return json_response(
             {"sessions": result, "total": len(result), "atmosphere_levels": levels}
         )
+
+    async def api_reset_circuit(self):
+        """手动解除某个会话的发送熔断（面板按钮）。"""
+        payload = await request.json(default={})
+        key = str(payload.get("session_key") or "").strip()
+        if not key:
+            return error_response("缺少 session_key")
+        session = await self.store.get_session(key)
+        if not session:
+            return error_response("会话不存在", status_code=404)
+        await self._clear_send_circuit(key)
+        await self.store.add_event("send_circuit_reset", key)
+        return json_response({"session_key": key, "reset": True})
 
     async def api_dedupe_messages(self):
         """清理重复的聊天记录（面板按钮）。"""
@@ -3365,6 +3690,7 @@ class ProactiveCompanionPlugin(Star):
         if not text:
             return json_response({"sent": False, "reason": "没有可发送的内容"})
         sent = await self._deliver(key, text)
+        await self._on_send_result(key, sent)
         if sent:
             await self.store.add_message(
                 key, "proactive", text, "bot", "", dedupe_window=10.0
