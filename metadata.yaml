@@ -31,7 +31,8 @@ desc: |
   `/陪伴 名单`、`/陪伴 熔断`、`/陪伴 清空`
   （指令仅限管理员使用，普通成员触发时会收到权限不足提示）
 
-  完整更新日志见仓库 README 的「📋 更新日志」章节。
+  完整更新日志见 GitHub Releases：
+  https://github.com/hongdougao111/astrbot_plugin_proactive_companion/releases
 
 version: 1.2.11
 author: hongdougao111
