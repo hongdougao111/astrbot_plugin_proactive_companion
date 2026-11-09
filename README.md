@@ -158,7 +158,7 @@ git clone https://github.com/hongdougao111/astrbot_plugin_proactive_companion.gi
 python tests/test_proactive_companion.py
 ```
 
-当前结果：**330 项断言全部通过**（另有一份发布前体检脚本，覆盖市场规范/配置类型/包内容检查）。
+当前结果：**343 项断言全部通过**（另有一份发布前体检脚本，覆盖市场规范/配置类型/包内容检查）。
 
 ## 📋 更新日志
 
