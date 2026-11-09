@@ -171,6 +171,33 @@ def _now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """把配置/数据库里的值转成 float，**保留合法的 0**。
+
+    不能用 `value or default`：0.0 是 arousal / valence / 计数的合法取值，
+    被 or 当成「空」会把它悄悄替换成默认值。None、空串、坏字符串才回退。
+    """
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _next_active_iso(now: _dt.datetime, quiet: list | None) -> str | None:
+    """下一个可打扰时刻的 ISO 字符串，用于面板展示。
+
+    全天免打扰（`00:00-24:00`）时 :func:`dnd.next_active_time` 会返回 None，
+    早期直接裸调 `.isoformat()`，导致「安排了全天免打扰」的用户点开面板就
+    500（AttributeError: 'NoneType' object has no attribute 'isoformat'）。
+    """
+    if not dnd.in_quiet_hours(now, quiet):
+        return None
+    upcoming = dnd.next_active_time(now, quiet)
+    return upcoming.isoformat() if upcoming is not None else None
+
+
 def _safe_json_list(raw: Any) -> list[Any]:
     """安全解析标签数组，坏数据不炸。"""
     if isinstance(raw, list):
@@ -704,18 +731,44 @@ class ProactiveCompanionPlugin(Star):
     _USER_DEDUPE_WINDOW = 30.0
 
     def _clear_circuit_background(self, event: AstrMessageEvent) -> None:
-        """收到入站消息时异步解除该会话的发送熔断（不阻塞消息处理）。"""
+        """收到入站消息时解除该会话的发送熔断（不阻塞消息处理）。
+
+        早期只查内存里的 `_send_fail_sessions`，而这个集合每次进程启动都是空的：
+        重启前已经熔断的会话，重启后再也不会因为「收到新消息」而恢复，
+        只能一直等到退避到期（最长 12 小时）或者手动 `/陪伴 熔断 解除`。
+        现在内存集合未命中时再查一次数据库（同样走异步任务，不阻塞）。
+        """
         try:
             umo = str(event.unified_msg_origin or "")
         except Exception:  # pragma: no cover
             return
-        if not umo or umo not in self._send_fail_sessions:
+        if not umo:
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover - 非异步环境
             return
-        loop.create_task(self._clear_send_circuit(umo))
+        if umo in self._send_fail_sessions:
+            loop.create_task(self._clear_send_circuit(umo))
+            return
+        loop.create_task(self._clear_circuit_if_stale(umo))
+
+    async def _clear_circuit_if_stale(self, umo: str) -> None:
+        """内存里没记过失败时，回库确认这个会话是否带着熔断状态（重启后）。"""
+        try:
+            session = await self.store.get_session(umo)
+        except Exception:  # pragma: no cover
+            return
+        if not session:
+            return
+        if (
+            int(session.get("send_fail_count") or 0) <= 0
+            and not int(session.get("circuit_open") or 0)
+            and not float(session.get("circuit_until") or 0)
+        ):
+            return
+        self._send_fail_sessions.add(umo)
+        await self._clear_send_circuit(umo)
 
     async def _record_user_message(
         self,
@@ -1439,10 +1492,12 @@ class ProactiveCompanionPlugin(Star):
     # 情绪工具
     # ------------------------------------------------------------------
     def _session_mood(self, session: dict[str, Any]) -> emotion.EmotionState:
+        # 注意不能用 `x or 默认值`：arousal 取合法值 0.0（完全平静）时
+        # 会被当成「缺省」，硬拉回 0.3，情绪面板永远显示不出真正的零唤醒。
         state = emotion.EmotionState(
-            valence=float(session.get("valence") or 0.0),
-            arousal=float(session.get("arousal") or emotion.BASE_AROUSAL),
-            updated_at=float(session.get("mood_updated_at") or 0.0),
+            valence=_as_float(session.get("valence"), 0.0),
+            arousal=_as_float(session.get("arousal"), emotion.BASE_AROUSAL),
+            updated_at=_as_float(session.get("mood_updated_at"), 0.0),
         )
         if not self._cfg_bool("mood_enabled", True):
             return emotion.EmotionState()
@@ -1659,12 +1714,14 @@ class ProactiveCompanionPlugin(Star):
     def _hit_any(items: list[str], candidates: set[str]) -> bool:
         """名单是否命中候选集合（忽略大小写）。
 
-        除了「完全相等」，纯数字的名单项还允许与候选里出现的数字串做包含匹配：
-        同一个人的标识在不同平台/不同会话里形态并不一样（`12345`、
+        除了「完全相等」，纯数字的名单项还允许与候选里的**完整数字段**
+        匹配：同一个人的标识在不同平台/不同会话里形态并不一样（`12345`、
         `aiocqhttp:FriendMessage:12345`、`o.12345` 都可能指同一个人），
         只做完全相等会让用户「明明填了 QQ 号却匹配不上」。
-        为避免误放行，数字匹配要求数字串长度至少 4 位，且候选的数字串
-        必须包含该数字段（前后可带其它字符）。
+
+        匹配必须是整段相等，不能是子串包含：早期用 `item in part` 判断，
+        于是黑名单填 `1234` 会把 `912345`（以及 `123456`）一并拉黑——
+        名单填错一位就误伤大批用户。数字段长度同样要求至少 4 位。
         """
         if not items:
             return False
@@ -1676,8 +1733,9 @@ class ProactiveCompanionPlugin(Star):
                 for cand in candidates:
                     if not cand:
                         continue
+                    # 整段相等，不是子串包含（`1234` 不该命中 `912345`）
                     for part in re.findall(r"\d{4,}", cand):
-                        if item in part:
+                        if item == part:
                             return True
         return False
 
@@ -3473,11 +3531,7 @@ class ProactiveCompanionPlugin(Star):
                 "in_quiet_hours": dnd.in_quiet_hours(_dt.datetime.now(), quiet),
                 "private_limits": self._effective_limits("private"),
                 "group_limits": self._effective_limits("group"),
-                "next_available": (
-                    dnd.next_active_time(_dt.datetime.now(), quiet).isoformat()
-                    if dnd.in_quiet_hours(_dt.datetime.now(), quiet)
-                    else None
-                ),
+                "next_available": _next_active_iso(_dt.datetime.now(), quiet),
                 "avg_valence": round(avg_valence, 3),
                 "avg_arousal": round(avg_arousal, 3),
                 "mood_label": emotion.label_for(

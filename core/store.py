@@ -954,7 +954,11 @@ class Store:
                     first_seen = first_ts
                 last_seen = max(float(existing["last_seen"] or 0.0), last_ts)
                 score = float(existing["affection"] or 0.0)
-                if score <= 0 and count > 0:
+                # affection_at > 0 说明这份好感被「算过或手动改过」：
+                # 手动把它归零（拉黑某人 / 重新认识）之后，回填不能又按历史
+                # 消息条数把它算回去，否则用户每次点「重建画像」都白改。
+                touched = float(existing["affection_at"] or 0.0) > 0
+                if score <= 0 and count > 0 and not touched:
                     score = affection_mod.clamp(
                         count * affection_mod.DELTA_USER_MESSAGE
                     )

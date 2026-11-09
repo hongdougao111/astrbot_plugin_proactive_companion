@@ -3044,6 +3044,114 @@ async def main() -> None:
 
     ctx.send_message = orig_send  # type: ignore[assignment]
 
+    # ------------------------------------------------------------------
+    print("\n== 36. 五个边界 bug 的回归用例 ==")
+    # 36.1 全天免打扰时 /state 不能崩（next_active_time 返回 None）
+    plugin.config["quiet_hours"] = ["00:00-24:00"]
+    request_holder["current"] = MockRequest()
+    request_holder["current"].set_query()
+    try:
+        day_api = await plugin.api_state()
+        next_available = day_api.payload.get("next_available")
+        check("全天免打扰时 /state 不崩", True)
+        check("全天免打扰时 next_available 为 None", next_available is None, str(next_available))
+        check(
+            "全天免打扰被正确识别",
+            day_api.payload.get("in_quiet_hours") is True,
+            str(day_api.payload.get("in_quiet_hours")),
+        )
+    except Exception as exc:
+        check("全天免打扰时 /state 不崩", False, f"{type(exc).__name__}: {exc}")
+    plugin.config["quiet_hours"] = []
+
+    # 36.2 arousal 合法值 0.0 不能被 `or` 吞成 0.3
+    mood_umo = "aiocqhttp:FriendMessage:mood-zero"
+    await plugin.store.ensure_session(mood_umo, mood_umo, "aiocqhttp", "private", "零唤醒")
+    await plugin.store.update_session(
+        mood_umo, valence=0.0, arousal=0.0, mood_updated_at=time.time()
+    )
+    zero_session = await plugin.store.get_session(mood_umo) or {}
+    zero_mood = plugin._session_mood(zero_session)
+    check(
+        "arousal=0.0 不会被当成缺省 0.3",
+        zero_mood.arousal < 0.01,
+        f"arousal={zero_mood.arousal}",
+    )
+
+    # 36.3 数字名单必须是整段相等，不能子串包含
+    check("黑名单 1234 不误伤 912345", not plugin._hit_any(["1234"], {"912345"}))
+    check("黑名单 12345 不误伤 123456", not plugin._hit_any(["12345"], {"123456"}))
+    check(
+        "黑名单 912345 仍能命中带平台前缀的标识",
+        plugin._hit_any(["912345"], {"aiocqhttp:FriendMessage:912345"}),
+    )
+    check("黑名单 912345 仍能命中 o.912345", plugin._hit_any(["912345"], {"o.912345"}))
+    wl_umo = "aiocqhttp:FriendMessage:912345"
+    await plugin.store.ensure_session(wl_umo, wl_umo, "aiocqhttp", "private", "阿宝", "912345", "阿宝")
+    plugin.config["private_proactive_blacklist"] = ["9123"]
+    check(
+        "近似号码不会被误拉黑",
+        await plugin._private_whitelisted(await plugin.store.get_session(wl_umo) or {}),
+    )
+    plugin.config["private_proactive_blacklist"] = ["912345"]
+    check(
+        "精确号码正常拉黑",
+        not await plugin._private_whitelisted(await plugin.store.get_session(wl_umo) or {}),
+    )
+    plugin.config["private_proactive_blacklist"] = []
+
+    # 36.4 手动把好感改成 0 之后，重建画像不能又算回去
+    bf_umo = "aiocqhttp:FriendMessage:backfill-user"
+    await plugin.store.ensure_session(bf_umo, bf_umo, "aiocqhttp", "private", "乙", "u-bf", "乙")
+    for i in range(5):
+        await plugin.store.add_message(
+            bf_umo, "user", f"历史消息{i}", "乙", "u-bf", ts=time.time() - 50 + i
+        )
+    await plugin.store.backfill_profiles()
+    await plugin.store.update_profile_fields_by_user("u-bf", bf_umo, affection=0.0)
+    await plugin.store.backfill_profiles()
+    bf_profile = await plugin.store.get_profile(bf_umo, "u-bf") or {}
+    check(
+        "重建画像不覆盖手动清零的好感",
+        float(bf_profile.get("affection") or 0.0) == 0.0,
+        str(bf_profile.get("affection")),
+    )
+    # 没有任何互动痕迹的新画像仍然照常按历史消息补分
+    bf_umo2 = "aiocqhttp:FriendMessage:backfill-new"
+    await plugin.store.ensure_session(bf_umo2, bf_umo2, "aiocqhttp", "private", "丙", "u-new", "丙")
+    for i in range(3):
+        await plugin.store.add_message(
+            bf_umo2, "user", f"新消息{i}", "丙", "u-new", ts=time.time() - 20 + i
+        )
+    await plugin.store.backfill_profiles()
+    new_profile = await plugin.store.get_profile(bf_umo2, "u-new") or {}
+    check(
+        "从未算过好感的画像仍按历史补分",
+        float(new_profile.get("affection") or 0.0) > 0,
+        str(new_profile.get("affection")),
+    )
+
+    # 36.5 进程重启后收到新消息也要解除熔断（内存集合是空的）
+    reboot_umo = "aiocqhttp:FriendMessage:reboot-circuit"
+    await plugin.store.ensure_session(reboot_umo, reboot_umo, "aiocqhttp", "private", "重启")
+    await plugin.store.update_session(
+        reboot_umo,
+        send_fail_count=5,
+        circuit_open=1,
+        circuit_until=time.time() + 86400,
+        fail_updated_at=time.time(),
+    )
+    plugin._send_fail_sessions.discard(reboot_umo)  # 模拟重启：内存索引丢失
+    plugin.capture_message_background(MockEvent(reboot_umo, "在吗"))
+    await asyncio.sleep(0.3)
+    reboot_session = await plugin.store.get_session(reboot_umo) or {}
+    check(
+        "重启后收到新消息也能解除熔断",
+        not int(reboot_session.get("circuit_open") or 0)
+        and not int(reboot_session.get("send_fail_count") or 0),
+        f"open={reboot_session.get('circuit_open')} fails={reboot_session.get('send_fail_count')}",
+    )
+
     shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n" + "=" * 52)
